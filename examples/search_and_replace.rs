@@ -11,8 +11,9 @@ extern crate ropey;
 
 use std::fs::File;
 use std::io;
+use std::time::SystemTime;
 
-use ropey::{iter::Chars, Rope, RopeSlice};
+use ropey::{iter::Bytes, Rope, RopeSlice};
 
 fn main() {
     // Get arguments from commandline
@@ -30,13 +31,17 @@ fn main() {
     };
 
     // Load file contents into a rope.
+    let now = SystemTime::now();
     let mut text = Rope::from_reader(io::BufReader::new(File::open(&filepath).unwrap())).expect("Cannot read file: either it doesn't exist, file permissions don't allow reading, or is not utf8 text.");
-
+    println!("load time: {}ms", now.elapsed().unwrap().as_millis());
+    Rope::print_sizes();
     // Do the search-and-replace.
+    let now = SystemTime::now();
     search_and_replace(&mut text, &search_pattern, &replacement_text);
-
+    let elapsed = now.elapsed().unwrap().as_millis();
+    println!("find/replace time: {}ms, leaves: {}, len {}", elapsed, text.count_nodes(), text.len_bytes());
     // Print the new text to stdout.
-    println!("{}", text);
+//    println!("{}", text);
 }
 
 /// Searches the rope for `search_pattern` and replaces all matches with
@@ -74,7 +79,7 @@ fn main() {
 /// all-around best.
 fn search_and_replace(rope: &mut Rope, search_pattern: &str, replacement_text: &str) {
     const BATCH_SIZE: usize = 256;
-    let replacement_text_len = replacement_text.chars().count();
+    let replacement_text_len = replacement_text.bytes().count();
 
     let mut head = 0; // Keep track of where we are between searches
     let mut matches = Vec::with_capacity(BATCH_SIZE);
@@ -125,11 +130,11 @@ fn search_and_replace(rope: &mut Rope, search_pattern: &str, replacement_text: &
 /// in, and the search-and-replace function above would work with it quite
 /// happily.
 struct SearchIter<'a> {
-    char_iter: Chars<'a>,
+    char_iter: Bytes<'a>,
     search_pattern: &'a str,
     search_pattern_char_len: usize,
     cur_index: usize, // The current char index of the search head.
-    possible_matches: Vec<std::str::Chars<'a>>, // Tracks where we are in the search pattern for the current possible matches.
+    possible_matches: Vec<std::str::Bytes<'a>>, // Tracks where we are in the search pattern for the current possible matches.
 }
 
 impl<'a> SearchIter<'a> {
@@ -139,9 +144,9 @@ impl<'a> SearchIter<'a> {
             "Can't search using an empty search pattern."
         );
         SearchIter {
-            char_iter: slice.chars(),
+            char_iter: slice.bytes(),
             search_pattern: search_pattern,
-            search_pattern_char_len: search_pattern.chars().count(),
+            search_pattern_char_len: search_pattern.bytes().count(),
             cur_index: 0,
             possible_matches: Vec::new(),
         }
@@ -158,7 +163,7 @@ impl<'a> Iterator for SearchIter<'a> {
 
             // Push new potential match, for a possible match starting at the
             // current char.
-            self.possible_matches.push(self.search_pattern.chars());
+            self.possible_matches.push(self.search_pattern.bytes());
 
             // Check the rope's char against the next character in each of
             // the potential matches, removing the potential matches that

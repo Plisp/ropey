@@ -9,10 +9,10 @@ use crate::iter::{Bytes, Chars, Chunks, Lines};
 use crate::rope_builder::RopeBuilder;
 use crate::slice::{end_bound_to_num, start_bound_to_num, RopeSlice};
 use crate::str_utils::{
-    byte_to_char_idx, byte_to_line_idx, byte_to_utf16_surrogate_idx, char_to_byte_idx,
+    byte_to_char_idx, byte_to_line_idx, char_to_byte_idx,
     char_to_line_idx, line_to_byte_idx, line_to_char_idx, utf16_code_unit_to_char_idx,
 };
-use crate::tree::{Count, Node, NodeChildren, TextInfo, MAX_BYTES};
+use crate::tree::{Count, Node, NodeChildren, NodeText, TextInfo, MAX_BYTES};
 
 /// A utf8 text rope.
 ///
@@ -260,7 +260,7 @@ impl Rope {
     #[inline]
     pub fn len_utf16_cu(&self) -> usize {
         let info = self.root.text_info();
-        (info.chars + info.utf16_surrogates) as usize
+        info.chars as usize
     }
 
     //-----------------------------------------------------------------------
@@ -854,11 +854,7 @@ impl Rope {
             self.len_chars()
         );
 
-        let (chunk, chunk_start_info) = self.root.get_chunk_at_char(char_idx);
-        let chunk_byte_idx = char_to_byte_idx(chunk, char_idx - chunk_start_info.chars as usize);
-        let surrogate_count = byte_to_utf16_surrogate_idx(chunk, chunk_byte_idx);
-
-        char_idx + chunk_start_info.utf16_surrogates as usize + surrogate_count
+        char_idx
     }
 
     /// Returns the char index of the given utf16 code unit.
@@ -888,8 +884,7 @@ impl Rope {
         );
 
         let (chunk, chunk_start_info) = self.root.get_chunk_at_utf16_code_unit(utf16_cu_idx);
-        let chunk_utf16_cu_idx =
-            utf16_cu_idx - (chunk_start_info.chars + chunk_start_info.utf16_surrogates) as usize;
+        let chunk_utf16_cu_idx = utf16_cu_idx - chunk_start_info.chars as usize;
         let chunk_char_idx = utf16_code_unit_to_char_idx(chunk, chunk_utf16_cu_idx);
 
         chunk_start_info.chars as usize + chunk_char_idx
@@ -1016,7 +1011,7 @@ impl Rope {
     #[inline]
     pub fn line(&self, line_idx: usize) -> RopeSlice {
         use crate::slice::RSEnum;
-        use crate::str_utils::{count_chars, count_utf16_surrogates};
+        use crate::str_utils::{count_chars};
 
         let len_lines = self.len_lines();
 
@@ -1036,7 +1031,6 @@ impl Rope {
             RopeSlice(RSEnum::Light {
                 text: text2,
                 char_count: count_chars(text2) as Count,
-                utf16_surrogate_count: count_utf16_surrogates(text2) as Count,
                 line_break_count: if line_idx == (len_lines - 1) { 0 } else { 1 },
             })
         } else {
@@ -1437,6 +1431,17 @@ impl Rope {
 
     //-----------------------------------------------------------------------
     // Debugging
+
+    pub fn print_sizes() {
+        println!("internal size: {}, leaf size: {}",
+                 std::mem::size_of::<NodeChildren>(),
+                 std::mem::size_of::<NodeText>()
+                 );
+    }
+
+    pub fn count_nodes(&self) -> usize {
+        self.root.count_nodes()
+    }
 
     /// NOT PART OF THE PUBLIC API (hidden from docs for a reason!)
     ///

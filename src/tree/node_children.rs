@@ -359,7 +359,7 @@ impl NodeChildren {
         let mut idx = 0;
         for info in self.info()[0..(self.len() - 1)].iter() {
             let next_accum = accum + *info;
-            if utf16_idx < (next_accum.chars + next_accum.utf16_surrogates) as usize {
+            if utf16_idx < next_accum.chars as usize {
                 break;
             }
             accum = next_accum;
@@ -370,9 +370,7 @@ impl NodeChildren {
         assert!(
             utf16_idx
                 <= (accum.chars
-                    + accum.utf16_surrogates
-                    + self.info()[idx].chars
-                    + self.info()[idx].utf16_surrogates) as usize,
+                    + self.info()[idx].chars) as usize,
             "Index out of bounds."
         );
 

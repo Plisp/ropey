@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::str_utils::{byte_to_line_idx, byte_to_utf16_surrogate_idx, char_to_byte_idx};
+use crate::str_utils::{byte_to_line_idx, char_to_byte_idx};
 use crate::tree::node_text::fix_segment_seam;
 use crate::tree::{
     Count, NodeChildren, NodeText, TextInfo, MAX_BYTES, MAX_CHILDREN, MIN_BYTES, MIN_CHILDREN,
@@ -35,12 +35,6 @@ impl Node {
     #[inline(always)]
     pub fn line_break_count(&self) -> usize {
         self.text_info().line_breaks as usize
-    }
-
-    /// Total number of line breaks in the Rope.
-    #[inline(always)]
-    pub fn utf16_surrogate_count(&self) -> usize {
-        self.text_info().utf16_surrogates as usize
     }
 
     /// Fetches a chunk mutably, and allows it to be edited via a closure.
@@ -510,7 +504,7 @@ impl Node {
                     let (child_i, acc_info) = children.search_utf16_code_unit_idx(utf16_idx);
                     info += acc_info;
                     node = &*children.nodes()[child_i];
-                    utf16_idx -= (acc_info.chars + acc_info.utf16_surrogates) as usize;
+                    utf16_idx -= acc_info.chars as usize;
                 }
             }
         }
@@ -549,8 +543,6 @@ impl Node {
         TextInfo {
             bytes: info.bytes + bi as Count,
             chars: char_idx as Count,
-            utf16_surrogates: info.utf16_surrogates
-                + byte_to_utf16_surrogate_idx(chunk, bi) as Count,
             line_breaks: info.line_breaks + byte_to_line_idx(chunk, bi) as Count,
         }
     }
@@ -633,6 +625,19 @@ impl Node {
                 }
             }
         }
+    }
+
+    pub fn count_nodes(&self) -> usize {
+       match *self {
+           Node::Leaf(_) => 1,
+           Node::Internal(ref children) => {
+               let mut sum = 0;
+               for(_, child) in children.iter() {
+                   sum += child.count_nodes();
+               }
+               sum
+           }
+       }
     }
 
     /// Debugging tool to make sure that all of the meta-data of the

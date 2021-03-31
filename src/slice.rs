@@ -4,8 +4,8 @@ use std::sync::Arc;
 use crate::iter::{Bytes, Chars, Chunks, Lines};
 use crate::rope::Rope;
 use crate::str_utils::{
-    byte_to_char_idx, byte_to_line_idx, byte_to_utf16_surrogate_idx, char_to_byte_idx,
-    char_to_line_idx, count_chars, count_line_breaks, count_utf16_surrogates, line_to_byte_idx,
+    byte_to_char_idx, byte_to_line_idx, char_to_byte_idx,
+    char_to_line_idx, count_chars, count_line_breaks, line_to_byte_idx,
     line_to_char_idx, utf16_code_unit_to_char_idx,
 };
 use crate::tree::{Count, Node, TextInfo};
@@ -33,7 +33,6 @@ pub(crate) enum RSEnum<'a> {
     Light {
         text: &'a str,
         char_count: Count,
-        utf16_surrogate_count: Count,
         line_break_count: Count,
     },
 }
@@ -50,7 +49,6 @@ impl<'a> RopeSlice<'a> {
                 return RopeSlice(RSEnum::Light {
                     text: text,
                     char_count: (end - start) as Count,
-                    utf16_surrogate_count: count_utf16_surrogates(text) as Count,
                     line_break_count: count_line_breaks(text) as Count,
                 });
             } else {
@@ -59,13 +57,11 @@ impl<'a> RopeSlice<'a> {
                     start_info: TextInfo {
                         bytes: 0,
                         chars: 0,
-                        utf16_surrogates: 0,
                         line_breaks: 0,
                     },
                     end_info: TextInfo {
                         bytes: node.byte_count() as Count,
                         chars: node.char_count() as Count,
-                        utf16_surrogates: node.utf16_surrogate_count() as Count,
                         line_breaks: node.line_break_count() as Count,
                     },
                 });
@@ -87,8 +83,6 @@ impl<'a> RopeSlice<'a> {
                     return RopeSlice(RSEnum::Light {
                         text: &text[start_byte..end_byte],
                         char_count: (n_end - n_start) as Count,
-                        utf16_surrogate_count: count_utf16_surrogates(&text[start_byte..end_byte])
-                            as Count,
                         line_break_count: count_line_breaks(&text[start_byte..end_byte]) as Count,
                     });
                 }
@@ -184,14 +178,12 @@ impl<'a> RopeSlice<'a> {
                 start_info,
                 ..
             }) => {
-                ((end_info.chars + end_info.utf16_surrogates)
-                    - (start_info.chars + start_info.utf16_surrogates)) as usize
+                (end_info.chars - start_info.chars) as usize
             }
             RopeSlice(RSEnum::Light {
                 char_count,
-                utf16_surrogate_count,
                 ..
-            }) => (char_count + utf16_surrogate_count) as usize,
+            }) => char_count as usize,
         }
     }
 
@@ -333,26 +325,15 @@ impl<'a> RopeSlice<'a> {
 
         match *self {
             RopeSlice(RSEnum::Full {
-                ref node,
                 start_info,
                 ..
             }) => {
                 let char_idx = char_idx + start_info.chars as usize;
-
-                let (chunk, chunk_start_info) = node.get_chunk_at_char(char_idx);
-                let chunk_byte_idx =
-                    char_to_byte_idx(chunk, char_idx - chunk_start_info.chars as usize);
-                let surrogate_count = byte_to_utf16_surrogate_idx(chunk, chunk_byte_idx);
-
-                char_idx + chunk_start_info.utf16_surrogates as usize + surrogate_count
-                    - start_info.chars as usize
-                    - start_info.utf16_surrogates as usize
+                char_idx - start_info.chars as usize
             }
 
-            RopeSlice(RSEnum::Light { text, .. }) => {
-                let byte_idx = char_to_byte_idx(text, char_idx);
-                let surrogate_count = byte_to_utf16_surrogate_idx(text, byte_idx);
-                char_idx + surrogate_count
+            RopeSlice(RSEnum::Light { .. }) => {
+                char_idx
             }
         }
     }
@@ -390,12 +371,9 @@ impl<'a> RopeSlice<'a> {
                 start_info,
                 ..
             }) => {
-                let utf16_cu_idx =
-                    utf16_cu_idx + (start_info.chars + start_info.utf16_surrogates) as usize;
-
+                let utf16_cu_idx = utf16_cu_idx + start_info.chars as usize;
                 let (chunk, chunk_start_info) = node.get_chunk_at_utf16_code_unit(utf16_cu_idx);
-                let chunk_utf16_cu_idx = utf16_cu_idx
-                    - (chunk_start_info.chars + chunk_start_info.utf16_surrogates) as usize;
+                let chunk_utf16_cu_idx = utf16_cu_idx - chunk_start_info.chars as usize;
                 let chunk_char_idx = utf16_code_unit_to_char_idx(chunk, chunk_utf16_cu_idx);
 
                 chunk_start_info.chars as usize + chunk_char_idx - start_info.chars as usize
@@ -545,7 +523,6 @@ impl<'a> RopeSlice<'a> {
             RopeSlice(RSEnum::Light {
                 text: text2,
                 char_count: count_chars(text2) as Count,
-                utf16_surrogate_count: count_utf16_surrogates(text2) as Count,
                 line_break_count: if line_idx == (len_lines - 1) { 0 } else { 1 },
             })
         } else {
@@ -802,7 +779,6 @@ impl<'a> RopeSlice<'a> {
                 RopeSlice(RSEnum::Light {
                     text: new_text,
                     char_count: (end - start) as Count,
-                    utf16_surrogate_count: count_utf16_surrogates(new_text) as Count,
                     line_break_count: count_line_breaks(new_text) as Count,
                 })
             }
@@ -1322,7 +1298,6 @@ impl<'a> From<&'a str> for RopeSlice<'a> {
         RopeSlice(RSEnum::Light {
             text: text,
             char_count: count_chars(text) as Count,
-            utf16_surrogate_count: count_utf16_surrogates(text) as Count,
             line_break_count: count_line_breaks(text) as Count,
         })
     }
