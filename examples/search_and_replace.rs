@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use ropey::{iter::Bytes, Rope, RopeSlice};
 
 fn main() {
+    Rope::print_sizes();
     // Get arguments from commandline
     let (search_pattern, replacement_text, filepath) = if std::env::args().count() > 3 {
         (
@@ -29,17 +30,16 @@ fn main() {
         );
         return;
     };
-
     // Load file contents into a rope.
     let now = SystemTime::now();
     let mut text = Rope::from_reader(io::BufReader::new(File::open(&filepath).unwrap())).expect("Cannot read file: either it doesn't exist, file permissions don't allow reading, or is not utf8 text.");
-    println!("load time: {}ms", now.elapsed().unwrap().as_millis());
-    Rope::print_sizes();
+    println!("load time: {} ms", now.elapsed().unwrap().as_nanos() as f32 / 1000000.0);
+    let _backup = text.clone();
     // Do the search-and-replace.
     let now = SystemTime::now();
     search_and_replace(&mut text, &search_pattern, &replacement_text);
-    let elapsed = now.elapsed().unwrap().as_millis();
-    println!("find/replace time: {}ms, leaves: {}, len {}", elapsed, text.count_nodes(), text.len_bytes());
+    let elapsed = now.elapsed().unwrap().as_nanos() as f32 / 1000000.0;
+    println!("find/replace time: {} ms, leaves: {}, len {}, depth {}", elapsed, text.count_nodes(), text.len_bytes(), text.depth());
     // Print the new text to stdout.
 //    println!("{}", text);
 }

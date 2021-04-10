@@ -1433,10 +1433,15 @@ impl Rope {
     // Debugging
 
     pub fn print_sizes() {
-        println!("internal size: {}, leaf size: {}",
+        println!("internal size: {}, leaf size: {}, node size: {}",
                  std::mem::size_of::<NodeChildren>(),
-                 std::mem::size_of::<NodeText>()
+                 std::mem::size_of::<NodeText>(),
+                 std::mem::size_of::<Node>()
                  );
+    }
+
+    pub fn depth(&self) -> usize {
+        self.root.depth()
     }
 
     pub fn count_nodes(&self) -> usize {
