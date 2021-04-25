@@ -78,7 +78,7 @@ fn main() {
 /// In this implementation we take approach #4 because it seems the
 /// all-around best.
 fn search_and_replace(rope: &mut Rope, search_pattern: &str, replacement_text: &str) {
-    const BATCH_SIZE: usize = 256;
+    const BATCH_SIZE: usize = 100000;
     let replacement_text_len = replacement_text.bytes().count();
 
     let mut head = 0; // Keep track of where we are between searches
