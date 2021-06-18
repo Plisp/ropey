@@ -1,4 +1,4 @@
-use std::ops::{Bound, RangeBounds};
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use crate::iter::{Bytes, Chars, Chunks, Lines};
@@ -9,6 +9,7 @@ use crate::str_utils::{
     line_to_char_idx, utf16_code_unit_to_char_idx,
 };
 use crate::tree::{Count, Node, TextInfo};
+use crate::{end_bound_to_num, start_bound_to_num, Error, Result};
 
 /// An immutable view into part of a `Rope`.
 ///
@@ -206,16 +207,7 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `byte_idx` is out of bounds (i.e. `byte_idx > len_bytes()`).
     #[inline]
     pub fn byte_to_char(&self, byte_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of slice: byte index {}, slice byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        let (chunk, b, c, _) = self.chunk_at_byte(byte_idx);
-        c + byte_to_char_idx(chunk, byte_idx - b)
+        self.try_byte_to_char(byte_idx).unwrap()
     }
 
     /// Returns the line index of the given byte.
@@ -234,16 +226,7 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `byte_idx` is out of bounds (i.e. `byte_idx > len_bytes()`).
     #[inline]
     pub fn byte_to_line(&self, byte_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of slice: byte index {}, slice byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        let (chunk, b, _, l) = self.chunk_at_byte(byte_idx);
-        l + byte_to_line_idx(chunk, byte_idx - b)
+        self.try_byte_to_line(byte_idx).unwrap()
     }
 
     /// Returns the byte index of the given char.
@@ -260,16 +243,7 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn char_to_byte(&self, char_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of slice: char index {}, slice char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        let (chunk, b, c, _) = self.chunk_at_char(char_idx);
-        b + char_to_byte_idx(chunk, char_idx - c)
+        self.try_char_to_byte(char_idx).unwrap()
     }
 
     /// Returns the line index of the given char.
@@ -288,16 +262,7 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn char_to_line(&self, char_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of slice: char index {}, slice char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        let (chunk, _, c, l) = self.chunk_at_char(char_idx);
-        l + char_to_line_idx(chunk, char_idx - c)
+        self.try_char_to_line(char_idx).unwrap()
     }
 
     /// Returns the utf16 code unit index of the given char.
@@ -314,28 +279,7 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn char_to_utf16_cu(&self, char_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of slice: char index {}, slice char \
-             length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                start_info,
-                ..
-            }) => {
-                let char_idx = char_idx + start_info.chars as usize;
-                char_idx - start_info.chars as usize
-            }
-
-            RopeSlice(RSEnum::Light { .. }) => {
-                char_idx
-            }
-        }
+        self.try_char_to_utf16_cu(char_idx).unwrap()
     }
 
     /// Returns the char index of the given utf16 code unit.
@@ -356,33 +300,7 @@ impl<'a> RopeSlice<'a> {
     /// (i.e. `utf16_cu_idx > len_utf16_cu()`).
     #[inline]
     pub fn utf16_cu_to_char(&self, utf16_cu_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            utf16_cu_idx <= self.len_utf16_cu(),
-            "Attempt to index past end of slice: utf16 code unit index {}, \
-             slice utf16 code unit length {}",
-            utf16_cu_idx,
-            self.len_utf16_cu()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                ref node,
-                start_info,
-                ..
-            }) => {
-                let utf16_cu_idx = utf16_cu_idx + start_info.chars as usize;
-                let (chunk, chunk_start_info) = node.get_chunk_at_utf16_code_unit(utf16_cu_idx);
-                let chunk_utf16_cu_idx = utf16_cu_idx - chunk_start_info.chars as usize;
-                let chunk_char_idx = utf16_code_unit_to_char_idx(chunk, chunk_utf16_cu_idx);
-
-                chunk_start_info.chars as usize + chunk_char_idx - start_info.chars as usize
-            }
-
-            RopeSlice(RSEnum::Light { text, .. }) => {
-                utf16_code_unit_to_char_idx(text, utf16_cu_idx)
-            }
-        }
+        self.try_utf16_cu_to_char(utf16_cu_idx).unwrap()
     }
 
     /// Returns the byte index of the start of the given line.
@@ -400,20 +318,7 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `line_idx` is out of bounds (i.e. `line_idx > len_lines()`).
     #[inline]
     pub fn line_to_byte(&self, line_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            line_idx <= self.len_lines(),
-            "Attempt to index past end of slice: line index {}, slice line length {}",
-            line_idx,
-            self.len_lines()
-        );
-
-        if line_idx == self.len_lines() {
-            self.len_bytes()
-        } else {
-            let (chunk, b, _, l) = self.chunk_at_line_break(line_idx);
-            b + line_to_byte_idx(chunk, line_idx - l)
-        }
+        self.try_line_to_byte(line_idx).unwrap()
     }
 
     /// Returns the char index of the start of the given line.
@@ -431,20 +336,7 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `line_idx` is out of bounds (i.e. `line_idx > len_lines()`).
     #[inline]
     pub fn line_to_char(&self, line_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            line_idx <= self.len_lines(),
-            "Attempt to index past end of slice: line index {}, slice line length {}",
-            line_idx,
-            self.len_lines()
-        );
-
-        if line_idx == self.len_lines() {
-            self.len_chars()
-        } else {
-            let (chunk, _, c, l) = self.chunk_at_line_break(line_idx);
-            c + line_to_char_idx(chunk, line_idx - l)
-        }
+        self.try_line_to_char(line_idx).unwrap()
     }
 
     //-----------------------------------------------------------------------
@@ -460,16 +352,15 @@ impl<'a> RopeSlice<'a> {
     #[inline]
     pub fn byte(&self, byte_idx: usize) -> u8 {
         // Bounds check
-        assert!(
-            byte_idx < self.len_bytes(),
-            "Attempt to index past end of slice: byte index {}, slice byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        let (chunk, chunk_byte_idx, _, _) = self.chunk_at_byte(byte_idx);
-        let chunk_rel_byte_idx = byte_idx - chunk_byte_idx;
-        chunk.as_bytes()[chunk_rel_byte_idx]
+        if let Some(out) = self.get_byte(byte_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of slice: byte index {}, slice byte length {}",
+                byte_idx,
+                self.len_bytes()
+            );
+        }
     }
 
     /// Returns the char at `char_idx`.
@@ -481,17 +372,15 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx >= len_chars()`).
     #[inline]
     pub fn char(&self, char_idx: usize) -> char {
-        // Bounds check
-        assert!(
-            char_idx < self.len_chars(),
-            "Attempt to index past end of slice: char index {}, slice char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        let (chunk, _, chunk_char_idx, _) = self.chunk_at_char(char_idx);
-        let byte_idx = char_to_byte_idx(chunk, char_idx - chunk_char_idx);
-        chunk[byte_idx..].chars().next().unwrap()
+        if let Some(out) = self.get_char(char_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of slice: char index {}, slice char length {}",
+                char_idx,
+                self.len_chars()
+            );
+        }
     }
 
     /// Returns the line at `line_idx`.
@@ -505,30 +394,14 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `line_idx` is out of bounds (i.e. `line_idx >= len_lines()`).
     #[inline]
     pub fn line(&self, line_idx: usize) -> RopeSlice<'a> {
-        let len_lines = self.len_lines();
-
-        // Bounds check
-        assert!(
-            line_idx < len_lines,
-            "Attempt to index past end of slice: line index {}, slice line length {}",
-            line_idx,
-            len_lines
-        );
-
-        let (chunk_1, _, c1, l1) = self.chunk_at_line_break(line_idx);
-        let (chunk_2, _, c2, l2) = self.chunk_at_line_break(line_idx + 1);
-        if c1 == c2 {
-            let text1 = &chunk_1[line_to_byte_idx(chunk_1, line_idx - l1)..];
-            let text2 = &text1[..line_to_byte_idx(text1, 1)];
-            RopeSlice(RSEnum::Light {
-                text: text2,
-                char_count: count_chars(text2) as Count,
-                line_break_count: if line_idx == (len_lines - 1) { 0 } else { 1 },
-            })
+        if let Some(out) = self.get_line(line_idx) {
+            out
         } else {
-            let start = c1 + line_to_char_idx(chunk_1, line_idx - l1);
-            let end = c2 + line_to_char_idx(chunk_2, line_idx + 1 - l2);
-            self.slice(start..end)
+            let len_lines = self.len_lines();
+            panic!(
+                "Attempt to index past end of slice: line index {}, slice line length {}",
+                line_idx, len_lines
+            );
         }
     }
 
@@ -549,41 +422,7 @@ impl<'a> RopeSlice<'a> {
     ///
     /// Panics if `byte_idx` is out of bounds (i.e. `byte_idx > len_bytes()`).
     pub fn chunk_at_byte(&self, byte_idx: usize) -> (&'a str, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of slice: byte index {}, slice byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                node,
-                start_info,
-                end_info,
-            }) => {
-                // Get the chunk.
-                let (chunk, chunk_start_info) =
-                    node.get_chunk_at_byte(byte_idx + start_info.bytes as usize);
-
-                // Calculate clipped start/end byte indices within the chunk.
-                let chunk_start_byte_idx = start_info.bytes.saturating_sub(chunk_start_info.bytes);
-                let chunk_end_byte_idx =
-                    (chunk.len() as Count).min(end_info.bytes - chunk_start_info.bytes);
-
-                // Return the clipped chunk and byte offset.
-                (
-                    &chunk[chunk_start_byte_idx as usize..chunk_end_byte_idx as usize],
-                    chunk_start_info.bytes.saturating_sub(start_info.bytes) as usize,
-                    chunk_start_info.chars.saturating_sub(start_info.chars) as usize,
-                    chunk_start_info
-                        .line_breaks
-                        .saturating_sub(start_info.line_breaks) as usize,
-                )
-            }
-            RopeSlice(RSEnum::Light { text, .. }) => (text, 0, 0, 0),
-        }
+        self.try_chunk_at_byte(byte_idx).unwrap()
     }
 
     /// Returns the chunk containing the given char index.
@@ -603,40 +442,14 @@ impl<'a> RopeSlice<'a> {
     ///
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     pub fn chunk_at_char(&self, char_idx: usize) -> (&'a str, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of slice: char index {}, slice char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                node,
-                start_info,
-                end_info,
-            }) => {
-                // Get the chunk.
-                let (chunk, chunk_start_info) =
-                    node.get_chunk_at_char(char_idx + start_info.chars as usize);
-
-                // Calculate clipped start/end byte indices within the chunk.
-                let chunk_start_byte_idx = start_info.bytes.saturating_sub(chunk_start_info.bytes);
-                let chunk_end_byte_idx =
-                    (chunk.len() as Count).min(end_info.bytes - chunk_start_info.bytes);
-
-                // Return the clipped chunk and byte offset.
-                (
-                    &chunk[chunk_start_byte_idx as usize..chunk_end_byte_idx as usize],
-                    chunk_start_info.bytes.saturating_sub(start_info.bytes) as usize,
-                    chunk_start_info.chars.saturating_sub(start_info.chars) as usize,
-                    chunk_start_info
-                        .line_breaks
-                        .saturating_sub(start_info.line_breaks) as usize,
-                )
-            }
-            RopeSlice(RSEnum::Light { text, .. }) => (text, 0, 0, 0),
+        if let Some(out) = self.get_chunk_at_char(char_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of slice: char index {}, slice char length {}",
+                char_idx,
+                self.len_chars()
+            );
         }
     }
 
@@ -660,45 +473,14 @@ impl<'a> RopeSlice<'a> {
     ///
     /// Panics if `line_break_idx` is out of bounds (i.e. `line_break_idx > len_lines()`).
     pub fn chunk_at_line_break(&self, line_break_idx: usize) -> (&'a str, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            line_break_idx <= self.len_lines(),
-            "Attempt to index past end of Rope: line break index {}, max index {}",
-            line_break_idx,
-            self.len_lines()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                node,
-                start_info,
-                end_info,
-            }) => {
-                // Get the chunk.
-                let (chunk, chunk_start_info) = if line_break_idx == 0 {
-                    node.get_chunk_at_byte(start_info.bytes as usize)
-                } else if line_break_idx == self.len_lines() {
-                    node.get_chunk_at_byte(end_info.bytes as usize)
-                } else {
-                    node.get_chunk_at_line_break(line_break_idx + start_info.line_breaks as usize)
-                };
-
-                // Calculate clipped start/end byte indices within the chunk.
-                let chunk_start_byte_idx = start_info.bytes.saturating_sub(chunk_start_info.bytes);
-                let chunk_end_byte_idx =
-                    (chunk.len() as Count).min(end_info.bytes - chunk_start_info.bytes);
-
-                // Return the clipped chunk and byte offset.
-                (
-                    &chunk[chunk_start_byte_idx as usize..chunk_end_byte_idx as usize],
-                    chunk_start_info.bytes.saturating_sub(start_info.bytes) as usize,
-                    chunk_start_info.chars.saturating_sub(start_info.chars) as usize,
-                    chunk_start_info
-                        .line_breaks
-                        .saturating_sub(start_info.line_breaks) as usize,
-                )
-            }
-            RopeSlice(RSEnum::Light { text, .. }) => (text, 0, 0, 0),
+        if let Some(out) = self.get_chunk_at_line_break(line_break_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: line break index {}, max index {}",
+                line_break_idx,
+                self.len_lines()
+            );
         }
     }
 
@@ -824,31 +606,14 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `byte_idx` is out of bounds (i.e. `byte_idx > len_bytes()`).
     #[inline]
     pub fn bytes_at(&self, byte_idx: usize) -> Bytes {
-        // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of RopeSlice: byte index {}, RopeSlice byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                node,
-                start_info,
-                end_info,
-            }) => Bytes::new_with_range_at(
-                node,
-                start_info.bytes as usize + byte_idx,
-                (start_info.bytes as usize, end_info.bytes as usize),
-                (start_info.chars as usize, end_info.chars as usize),
-                (
-                    start_info.line_breaks as usize,
-                    end_info.line_breaks as usize + 1,
-                ),
-            ),
-
-            RopeSlice(RSEnum::Light { text, .. }) => Bytes::from_str_at(text, byte_idx),
+        if let Some(out) = self.get_bytes_at(byte_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of RopeSlice: byte index {}, RopeSlice byte length {}",
+                byte_idx,
+                self.len_bytes()
+            );
         }
     }
 
@@ -888,31 +653,14 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn chars_at(&self, char_idx: usize) -> Chars {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of RopeSlice: char index {}, RopeSlice char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                node,
-                start_info,
-                end_info,
-            }) => Chars::new_with_range_at(
-                node,
-                start_info.chars as usize + char_idx,
-                (start_info.bytes as usize, end_info.bytes as usize),
-                (start_info.chars as usize, end_info.chars as usize),
-                (
-                    start_info.line_breaks as usize,
-                    end_info.line_breaks as usize + 1,
-                ),
-            ),
-
-            RopeSlice(RSEnum::Light { text, .. }) => Chars::from_str_at(text, char_idx),
+        if let Some(out) = self.get_chars_at(char_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of RopeSlice: char index {}, RopeSlice char length {}",
+                char_idx,
+                self.len_chars()
+            );
         }
     }
 
@@ -951,29 +699,14 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `line_idx` is out of bounds (i.e. `line_idx > len_lines()`).
     #[inline]
     pub fn lines_at(&self, line_idx: usize) -> Lines {
-        // Bounds check
-        assert!(
-            line_idx <= self.len_lines(),
-            "Attempt to index past end of RopeSlice: line index {}, RopeSlice line length {}",
-            line_idx,
-            self.len_lines()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                node,
-                start_info,
-                end_info,
-            }) => Lines::new_with_range_at(
-                node,
-                start_info.line_breaks as usize + line_idx,
-                (start_info.chars as usize, end_info.chars as usize),
-                (
-                    start_info.line_breaks as usize,
-                    end_info.line_breaks as usize + 1,
-                ),
-            ),
-            RopeSlice(RSEnum::Light { text, .. }) => Lines::from_str_at(text, line_idx),
+        if let Some(out) = self.get_lines_at(line_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of RopeSlice: line index {}, RopeSlice line length {}",
+                line_idx,
+                self.len_lines()
+            );
         }
     }
 
@@ -1019,59 +752,14 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `byte_idx` is out of bounds (i.e. `byte_idx > len_bytes()`).
     #[inline]
     pub fn chunks_at_byte(&self, byte_idx: usize) -> (Chunks<'a>, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of RopeSlice: byte index {}, RopeSlice byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                node,
-                start_info,
-                end_info,
-            }) => {
-                let (chunks, chunk_byte_idx, chunk_char_idx, chunk_line_idx) =
-                    Chunks::new_with_range_at_byte(
-                        node,
-                        byte_idx + start_info.bytes as usize,
-                        (start_info.bytes as usize, end_info.bytes as usize),
-                        (start_info.chars as usize, end_info.chars as usize),
-                        (
-                            start_info.line_breaks as usize,
-                            end_info.line_breaks as usize + 1,
-                        ),
-                    );
-
-                (
-                    chunks,
-                    chunk_byte_idx.saturating_sub(start_info.bytes as usize),
-                    chunk_char_idx.saturating_sub(start_info.chars as usize),
-                    chunk_line_idx.saturating_sub(start_info.line_breaks as usize),
-                )
-            }
-
-            RopeSlice(RSEnum::Light {
-                text,
-                char_count,
-                line_break_count,
-                ..
-            }) => {
-                let chunks = Chunks::from_str(text, byte_idx == text.len());
-
-                if byte_idx == text.len() {
-                    (
-                        chunks,
-                        text.len(),
-                        char_count as usize,
-                        line_break_count as usize,
-                    )
-                } else {
-                    (chunks, 0, 0, 0)
-                }
-            }
+        if let Some(out) = self.get_chunks_at_byte(byte_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of RopeSlice: byte index {}, RopeSlice byte length {}",
+                byte_idx,
+                self.len_bytes()
+            );
         }
     }
 
@@ -1094,59 +782,14 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn chunks_at_char(&self, char_idx: usize) -> (Chunks<'a>, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of RopeSlice: char index {}, RopeSlice char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                node,
-                start_info,
-                end_info,
-            }) => {
-                let (chunks, chunk_byte_idx, chunk_char_idx, chunk_line_idx) =
-                    Chunks::new_with_range_at_char(
-                        node,
-                        char_idx + start_info.chars as usize,
-                        (start_info.bytes as usize, end_info.bytes as usize),
-                        (start_info.chars as usize, end_info.chars as usize),
-                        (
-                            start_info.line_breaks as usize,
-                            end_info.line_breaks as usize + 1,
-                        ),
-                    );
-
-                (
-                    chunks,
-                    chunk_byte_idx.saturating_sub(start_info.bytes as usize),
-                    chunk_char_idx.saturating_sub(start_info.chars as usize),
-                    chunk_line_idx.saturating_sub(start_info.line_breaks as usize),
-                )
-            }
-
-            RopeSlice(RSEnum::Light {
-                text,
-                char_count,
-                line_break_count,
-                ..
-            }) => {
-                let chunks = Chunks::from_str(text, char_idx == char_count as usize);
-
-                if char_idx == char_count as usize {
-                    (
-                        chunks,
-                        text.len(),
-                        char_count as usize,
-                        line_break_count as usize,
-                    )
-                } else {
-                    (chunks, 0, 0, 0)
-                }
-            }
+        if let Some(out) = self.get_chunks_at_char(char_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of RopeSlice: char index {}, RopeSlice char length {}",
+                char_idx,
+                self.len_chars()
+            );
         }
     }
 
@@ -1173,105 +816,661 @@ impl<'a> RopeSlice<'a> {
     /// Panics if `line_break_idx` is out of bounds (i.e. `line_break_idx > len_lines()`).
     #[inline]
     pub fn chunks_at_line_break(&self, line_break_idx: usize) -> (Chunks, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            line_break_idx <= self.len_lines(),
-            "Attempt to index past end of RopeSlice: line break index {}, RopeSlice line break max index {}",
-            line_break_idx,
-            self.len_lines()
-        );
-
-        match *self {
-            RopeSlice(RSEnum::Full {
-                node,
-                start_info,
-                end_info,
-            }) => {
-                // Get the chunk.
-                let (chunks, chunk_byte_idx, chunk_char_idx, chunk_line_idx) =
-                    if line_break_idx == 0 {
-                        Chunks::new_with_range_at_byte(
-                            node,
-                            start_info.bytes as usize,
-                            (start_info.bytes as usize, end_info.bytes as usize),
-                            (start_info.chars as usize, end_info.chars as usize),
-                            (
-                                start_info.line_breaks as usize,
-                                end_info.line_breaks as usize + 1,
-                            ),
-                        )
-                    } else if line_break_idx == self.len_lines() {
-                        Chunks::new_with_range_at_byte(
-                            node,
-                            end_info.bytes as usize,
-                            (start_info.bytes as usize, end_info.bytes as usize),
-                            (start_info.chars as usize, end_info.chars as usize),
-                            (
-                                start_info.line_breaks as usize,
-                                end_info.line_breaks as usize + 1,
-                            ),
-                        )
-                    } else {
-                        Chunks::new_with_range_at_line_break(
-                            node,
-                            line_break_idx + start_info.line_breaks as usize,
-                            (start_info.bytes as usize, end_info.bytes as usize),
-                            (start_info.chars as usize, end_info.chars as usize),
-                            (
-                                start_info.line_breaks as usize,
-                                end_info.line_breaks as usize + 1,
-                            ),
-                        )
-                    };
-
-                (
-                    chunks,
-                    chunk_byte_idx.saturating_sub(start_info.bytes as usize),
-                    chunk_char_idx.saturating_sub(start_info.chars as usize),
-                    chunk_line_idx.saturating_sub(start_info.line_breaks as usize),
-                )
-            }
-
-            RopeSlice(RSEnum::Light {
-                text,
-                char_count,
-                line_break_count,
-                ..
-            }) => {
-                let chunks = Chunks::from_str(text, line_break_idx == line_break_count as usize);
-
-                if line_break_idx == line_break_count as usize {
-                    (
-                        chunks,
-                        text.len(),
-                        char_count as usize,
-                        line_break_count as usize,
-                    )
-                } else {
-                    (chunks, 0, 0, 0)
-                }
-            }
+        if let Some(out) = self.get_chunks_at_line_break(line_break_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of RopeSlice: line break index {}, RopeSlice line break max index {}",
+                line_break_idx,
+                self.len_lines()
+            );
         }
     }
 }
 
-//==============================================================
-
-#[inline(always)]
-pub(crate) fn start_bound_to_num(b: Bound<&usize>) -> Option<usize> {
-    match b {
-        Bound::Included(n) => Some(*n),
-        Bound::Excluded(n) => Some(*n + 1),
-        Bound::Unbounded => None,
+/// # Non-Panicking
+///
+/// The methods in this impl block provide non-panicking versions of
+/// `RopeSlice`'s panicking methods.  They return either `Option::None` or
+/// `Result::Err()` when their panicking counterparts would have panicked.
+impl<'a> RopeSlice<'a> {
+    /// Non-panicking version of [`byte_to_char()`](RopeSlice::byte_to_char).
+    #[inline]
+    pub fn try_byte_to_char(&self, byte_idx: usize) -> Result<usize> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            let (chunk, b, c, _) = self.chunk_at_byte(byte_idx);
+            Ok(c + byte_to_char_idx(chunk, byte_idx - b))
+        } else {
+            Err(Error::ByteIndexOutOfBounds(byte_idx, self.len_bytes()))
+        }
     }
-}
 
-#[inline(always)]
-pub(crate) fn end_bound_to_num(b: Bound<&usize>) -> Option<usize> {
-    match b {
-        Bound::Included(n) => Some(*n + 1),
-        Bound::Excluded(n) => Some(*n),
-        Bound::Unbounded => None,
+    /// Non-panicking version of [`byte_to_line()`](RopeSlice::byte_to_line).
+    #[inline]
+    pub fn try_byte_to_line(&self, byte_idx: usize) -> Result<usize> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            let (chunk, b, _, l) = self.chunk_at_byte(byte_idx);
+            Ok(l + byte_to_line_idx(chunk, byte_idx - b))
+        } else {
+            Err(Error::ByteIndexOutOfBounds(byte_idx, self.len_bytes()))
+        }
+    }
+
+    /// Non-panicking version of [`char_to_byte()`](RopeSlice::char_to_byte).
+    #[inline]
+    pub fn try_char_to_byte(&self, char_idx: usize) -> Result<usize> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            let (chunk, b, c, _) = self.chunk_at_char(char_idx);
+            Ok(b + char_to_byte_idx(chunk, char_idx - c))
+        } else {
+            Err(Error::CharIndexOutOfBounds(char_idx, self.len_chars()))
+        }
+    }
+
+    /// Non-panicking version of [`char_to_line()`](RopeSlice::char_to_line).
+    #[inline]
+    pub fn try_char_to_line(&self, char_idx: usize) -> Result<usize> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            let (chunk, _, c, l) = self.chunk_at_char(char_idx);
+            Ok(l + char_to_line_idx(chunk, char_idx - c))
+        } else {
+            Err(Error::CharIndexOutOfBounds(char_idx, self.len_chars()))
+        }
+    }
+
+    /// Non-panicking version of [`char_to_utf16_cu()`](RopeSlice::char_to_utf16_cu).
+    #[inline]
+    pub fn try_char_to_utf16_cu(&self, char_idx: usize) -> Result<usize> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    start_info,
+                    ..
+                }) => {
+                    let char_idx = char_idx + start_info.chars as usize;
+
+                    Ok(
+                        char_idx
+                            - start_info.chars as usize
+                    )
+                }
+
+                RopeSlice(RSEnum::Light { .. } ) => {
+                    Ok(char_idx)
+                }
+            }
+        } else {
+            Err(Error::CharIndexOutOfBounds(char_idx, self.len_chars()))
+        }
+    }
+
+    /// Non-panicking version of [`utf16_cu_to_char()`](RopeSlice::utf16_cu_to_char).
+    #[inline]
+    pub fn try_utf16_cu_to_char(&self, utf16_cu_idx: usize) -> Result<usize> {
+        // Bounds check
+        if utf16_cu_idx <= self.len_utf16_cu() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    ref node,
+                    start_info,
+                    ..
+                }) => {
+                    let utf16_cu_idx =
+                        utf16_cu_idx + (start_info.chars) as usize;
+
+                    let (chunk, chunk_start_info) = node.get_chunk_at_utf16_code_unit(utf16_cu_idx);
+                    let chunk_utf16_cu_idx = utf16_cu_idx
+                        - (chunk_start_info.chars) as usize;
+                    let chunk_char_idx = utf16_code_unit_to_char_idx(chunk, chunk_utf16_cu_idx);
+
+                    Ok(
+                        chunk_start_info.chars as usize + chunk_char_idx
+                            - start_info.chars as usize,
+                    )
+                }
+
+                RopeSlice(RSEnum::Light { text, .. }) => {
+                    Ok(utf16_code_unit_to_char_idx(text, utf16_cu_idx))
+                }
+            }
+        } else {
+            Err(Error::Utf16IndexOutOfBounds(
+                utf16_cu_idx,
+                self.len_utf16_cu(),
+            ))
+        }
+    }
+
+    /// Non-panicking version of [`line_to_byte()`](RopeSlice::line_to_byte).
+    #[inline]
+    pub fn try_line_to_byte(&self, line_idx: usize) -> Result<usize> {
+        // Bounds check
+        if line_idx <= self.len_lines() {
+            if line_idx == self.len_lines() {
+                Ok(self.len_bytes())
+            } else {
+                let (chunk, b, _, l) = self.chunk_at_line_break(line_idx);
+                Ok(b + line_to_byte_idx(chunk, line_idx - l))
+            }
+        } else {
+            Err(Error::LineIndexOutOfBounds(line_idx, self.len_lines()))
+        }
+    }
+
+    /// Non-panicking version of [`line_to_char()`](RopeSlice::line_to_char).
+    #[inline]
+    pub fn try_line_to_char(&self, line_idx: usize) -> Result<usize> {
+        // Bounds check
+        if line_idx <= self.len_lines() {
+            if line_idx == self.len_lines() {
+                Ok(self.len_chars())
+            } else {
+                let (chunk, _, c, l) = self.chunk_at_line_break(line_idx);
+                Ok(c + line_to_char_idx(chunk, line_idx - l))
+            }
+        } else {
+            Err(Error::LineIndexOutOfBounds(line_idx, self.len_lines()))
+        }
+    }
+
+    /// Non-panicking version of [`get_byte()`](RopeSlice::get_byte).
+    #[inline]
+    pub fn get_byte(&self, byte_idx: usize) -> Option<u8> {
+        // Bounds check
+        if byte_idx < self.len_bytes() {
+            let (chunk, chunk_byte_idx, _, _) = self.chunk_at_byte(byte_idx);
+            let chunk_rel_byte_idx = byte_idx - chunk_byte_idx;
+            Some(chunk.as_bytes()[chunk_rel_byte_idx])
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`char()`](RopeSlice::char).
+    #[inline]
+    pub fn get_char(&self, char_idx: usize) -> Option<char> {
+        // Bounds check
+        if char_idx < self.len_chars() {
+            let (chunk, _, chunk_char_idx, _) = self.chunk_at_char(char_idx);
+            let byte_idx = char_to_byte_idx(chunk, char_idx - chunk_char_idx);
+            Some(chunk[byte_idx..].chars().next().unwrap())
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`line()`](RopeSlice::line).
+    #[inline]
+    pub fn get_line(&self, line_idx: usize) -> Option<RopeSlice<'a>> {
+        let len_lines = self.len_lines();
+        // Bounds check
+        if line_idx < len_lines {
+            let (chunk_1, _, c1, l1) = self.chunk_at_line_break(line_idx);
+            let (chunk_2, _, c2, l2) = self.chunk_at_line_break(line_idx + 1);
+            if c1 == c2 {
+                let text1 = &chunk_1[line_to_byte_idx(chunk_1, line_idx - l1)..];
+                let text2 = &text1[..line_to_byte_idx(text1, 1)];
+                Some(RopeSlice(RSEnum::Light {
+                    text: text2,
+                    char_count: count_chars(text2) as Count,
+                    line_break_count: if line_idx == (len_lines - 1) { 0 } else { 1 },
+                }))
+            } else {
+                let start = c1 + line_to_char_idx(chunk_1, line_idx - l1);
+                let end = c2 + line_to_char_idx(chunk_2, line_idx + 1 - l2);
+                Some(self.slice(start..end))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunk_at_byte()`](RopeSlice::chunk_at_byte).
+    pub fn try_chunk_at_byte(&self, byte_idx: usize) -> Result<(&'a str, usize, usize, usize)> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node,
+                    start_info,
+                    end_info,
+                }) => {
+                    // Get the chunk.
+                    let (chunk, chunk_start_info) =
+                        node.get_chunk_at_byte(byte_idx + start_info.bytes as usize);
+
+                    // Calculate clipped start/end byte indices within the chunk.
+                    let chunk_start_byte_idx =
+                        start_info.bytes.saturating_sub(chunk_start_info.bytes);
+                    let chunk_end_byte_idx =
+                        (chunk.len() as Count).min(end_info.bytes - chunk_start_info.bytes);
+
+                    // Return the clipped chunk and byte offset.
+                    Ok((
+                        &chunk[chunk_start_byte_idx as usize..chunk_end_byte_idx as usize],
+                        chunk_start_info.bytes.saturating_sub(start_info.bytes) as usize,
+                        chunk_start_info.chars.saturating_sub(start_info.chars) as usize,
+                        chunk_start_info
+                            .line_breaks
+                            .saturating_sub(start_info.line_breaks)
+                            as usize,
+                    ))
+                }
+                RopeSlice(RSEnum::Light { text, .. }) => Ok((text, 0, 0, 0)),
+            }
+        } else {
+            Err(Error::ByteIndexOutOfBounds(byte_idx, self.len_bytes()))
+        }
+    }
+
+    /// Non-panicking version of [`chunk_at_char()`](RopeSlice::chunk_at_char).
+    pub fn get_chunk_at_char(&self, char_idx: usize) -> Option<(&'a str, usize, usize, usize)> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node,
+                    start_info,
+                    end_info,
+                }) => {
+                    // Get the chunk.
+                    let (chunk, chunk_start_info) =
+                        node.get_chunk_at_char(char_idx + start_info.chars as usize);
+
+                    // Calculate clipped start/end byte indices within the chunk.
+                    let chunk_start_byte_idx =
+                        start_info.bytes.saturating_sub(chunk_start_info.bytes);
+                    let chunk_end_byte_idx =
+                        (chunk.len() as Count).min(end_info.bytes - chunk_start_info.bytes);
+
+                    // Return the clipped chunk and byte offset.
+                    Some((
+                        &chunk[chunk_start_byte_idx as usize..chunk_end_byte_idx as usize],
+                        chunk_start_info.bytes.saturating_sub(start_info.bytes) as usize,
+                        chunk_start_info.chars.saturating_sub(start_info.chars) as usize,
+                        chunk_start_info
+                            .line_breaks
+                            .saturating_sub(start_info.line_breaks)
+                            as usize,
+                    ))
+                }
+                RopeSlice(RSEnum::Light { text, .. }) => Some((text, 0, 0, 0)),
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunk_at_line_break()`](RopeSlice::chunk_at_line_break).
+    pub fn get_chunk_at_line_break(
+        &self,
+        line_break_idx: usize,
+    ) -> Option<(&'a str, usize, usize, usize)> {
+        // Bounds check
+        if line_break_idx <= self.len_lines() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node,
+                    start_info,
+                    end_info,
+                }) => {
+                    // Get the chunk.
+                    let (chunk, chunk_start_info) = if line_break_idx == 0 {
+                        node.get_chunk_at_byte(start_info.bytes as usize)
+                    } else if line_break_idx == self.len_lines() {
+                        node.get_chunk_at_byte(end_info.bytes as usize)
+                    } else {
+                        node.get_chunk_at_line_break(
+                            line_break_idx + start_info.line_breaks as usize,
+                        )
+                    };
+
+                    // Calculate clipped start/end byte indices within the chunk.
+                    let chunk_start_byte_idx =
+                        start_info.bytes.saturating_sub(chunk_start_info.bytes);
+                    let chunk_end_byte_idx =
+                        (chunk.len() as Count).min(end_info.bytes - chunk_start_info.bytes);
+
+                    // Return the clipped chunk and byte offset.
+                    Some((
+                        &chunk[chunk_start_byte_idx as usize..chunk_end_byte_idx as usize],
+                        chunk_start_info.bytes.saturating_sub(start_info.bytes) as usize,
+                        chunk_start_info.chars.saturating_sub(start_info.chars) as usize,
+                        chunk_start_info
+                            .line_breaks
+                            .saturating_sub(start_info.line_breaks)
+                            as usize,
+                    ))
+                }
+                RopeSlice(RSEnum::Light { text, .. }) => Some((text, 0, 0, 0)),
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`slice()`](RopeSlice::slice).
+    pub fn get_slice<R>(&self, char_range: R) -> Option<Self>
+    where
+        R: RangeBounds<usize>,
+    {
+        let (start, end) = {
+            let start_range = start_bound_to_num(char_range.start_bound());
+            let end_range = end_bound_to_num(char_range.end_bound());
+
+            // Early-out shortcut for taking a slice of the full thing.
+            if start_range == None && end_range == None {
+                return Some(*self);
+            }
+
+            (
+                start_range.unwrap_or(0),
+                end_range.unwrap_or_else(|| self.len_chars()),
+            )
+        };
+
+        // Bounds check
+        if start <= end && end <= self.len_chars() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node, start_info, ..
+                }) => Some(RopeSlice::new_with_range(
+                    node,
+                    start_info.chars as usize + start,
+                    start_info.chars as usize + end,
+                )),
+                RopeSlice(RSEnum::Light { text, .. }) => {
+                    let start_byte = char_to_byte_idx(text, start);
+                    let end_byte = char_to_byte_idx(text, end);
+                    let new_text = &text[start_byte..end_byte];
+                    Some(RopeSlice(RSEnum::Light {
+                        text: new_text,
+                        char_count: (end - start) as Count,
+                        line_break_count: count_line_breaks(new_text) as Count,
+                    }))
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`bytes_at()`](RopeSlice::bytes_at).
+    #[inline]
+    pub fn get_bytes_at(&self, byte_idx: usize) -> Option<Bytes> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node,
+                    start_info,
+                    end_info,
+                }) => Some(Bytes::new_with_range_at(
+                    node,
+                    start_info.bytes as usize + byte_idx,
+                    (start_info.bytes as usize, end_info.bytes as usize),
+                    (start_info.chars as usize, end_info.chars as usize),
+                    (
+                        start_info.line_breaks as usize,
+                        end_info.line_breaks as usize + 1,
+                    ),
+                )),
+                RopeSlice(RSEnum::Light { text, .. }) => Some(Bytes::from_str_at(text, byte_idx)),
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chars_at()`](RopeSlice::chars_at).
+    #[inline]
+    pub fn get_chars_at(&self, char_idx: usize) -> Option<Chars> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node,
+                    start_info,
+                    end_info,
+                }) => Some(Chars::new_with_range_at(
+                    node,
+                    start_info.chars as usize + char_idx,
+                    (start_info.bytes as usize, end_info.bytes as usize),
+                    (start_info.chars as usize, end_info.chars as usize),
+                    (
+                        start_info.line_breaks as usize,
+                        end_info.line_breaks as usize + 1,
+                    ),
+                )),
+                RopeSlice(RSEnum::Light { text, .. }) => Some(Chars::from_str_at(text, char_idx)),
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`lines_at()`](RopeSlice::lines_at).
+    #[inline]
+    pub fn get_lines_at(&self, line_idx: usize) -> Option<Lines> {
+        // Bounds check
+        if line_idx <= self.len_lines() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node,
+                    start_info,
+                    end_info,
+                }) => Some(Lines::new_with_range_at(
+                    node,
+                    start_info.line_breaks as usize + line_idx,
+                    (start_info.chars as usize, end_info.chars as usize),
+                    (
+                        start_info.line_breaks as usize,
+                        end_info.line_breaks as usize + 1,
+                    ),
+                )),
+                RopeSlice(RSEnum::Light { text, .. }) => Some(Lines::from_str_at(text, line_idx)),
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunks_at_byte()`](RopeSlice::chunks_at_byte).
+    #[inline]
+    pub fn get_chunks_at_byte(&self, byte_idx: usize) -> Option<(Chunks<'a>, usize, usize, usize)> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node,
+                    start_info,
+                    end_info,
+                }) => {
+                    let (chunks, chunk_byte_idx, chunk_char_idx, chunk_line_idx) =
+                        Chunks::new_with_range_at_byte(
+                            node,
+                            byte_idx + start_info.bytes as usize,
+                            (start_info.bytes as usize, end_info.bytes as usize),
+                            (start_info.chars as usize, end_info.chars as usize),
+                            (
+                                start_info.line_breaks as usize,
+                                end_info.line_breaks as usize + 1,
+                            ),
+                        );
+
+                    Some((
+                        chunks,
+                        chunk_byte_idx.saturating_sub(start_info.bytes as usize),
+                        chunk_char_idx.saturating_sub(start_info.chars as usize),
+                        chunk_line_idx.saturating_sub(start_info.line_breaks as usize),
+                    ))
+                }
+                RopeSlice(RSEnum::Light {
+                    text,
+                    char_count,
+                    line_break_count,
+                    ..
+                }) => {
+                    let chunks = Chunks::from_str(text, byte_idx == text.len());
+
+                    if byte_idx == text.len() {
+                        Some((
+                            chunks,
+                            text.len(),
+                            char_count as usize,
+                            line_break_count as usize,
+                        ))
+                    } else {
+                        Some((chunks, 0, 0, 0))
+                    }
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunks_at_char()`](RopeSlice::chunks_at_char).
+    #[inline]
+    pub fn get_chunks_at_char(&self, char_idx: usize) -> Option<(Chunks<'a>, usize, usize, usize)> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node,
+                    start_info,
+                    end_info,
+                }) => {
+                    let (chunks, chunk_byte_idx, chunk_char_idx, chunk_line_idx) =
+                        Chunks::new_with_range_at_char(
+                            node,
+                            char_idx + start_info.chars as usize,
+                            (start_info.bytes as usize, end_info.bytes as usize),
+                            (start_info.chars as usize, end_info.chars as usize),
+                            (
+                                start_info.line_breaks as usize,
+                                end_info.line_breaks as usize + 1,
+                            ),
+                        );
+
+                    Some((
+                        chunks,
+                        chunk_byte_idx.saturating_sub(start_info.bytes as usize),
+                        chunk_char_idx.saturating_sub(start_info.chars as usize),
+                        chunk_line_idx.saturating_sub(start_info.line_breaks as usize),
+                    ))
+                }
+                RopeSlice(RSEnum::Light {
+                    text,
+                    char_count,
+                    line_break_count,
+                    ..
+                }) => {
+                    let chunks = Chunks::from_str(text, char_idx == char_count as usize);
+
+                    if char_idx == char_count as usize {
+                        Some((
+                            chunks,
+                            text.len(),
+                            char_count as usize,
+                            line_break_count as usize,
+                        ))
+                    } else {
+                        Some((chunks, 0, 0, 0))
+                    }
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunks_at_line_break()`](RopeSlice::chunks_at_line_break).
+    #[inline]
+    pub fn get_chunks_at_line_break(
+        &self,
+        line_break_idx: usize,
+    ) -> Option<(Chunks, usize, usize, usize)> {
+        // Bounds check
+        if line_break_idx <= self.len_lines() {
+            match *self {
+                RopeSlice(RSEnum::Full {
+                    node,
+                    start_info,
+                    end_info,
+                }) => {
+                    // Get the chunk.
+                    let (chunks, chunk_byte_idx, chunk_char_idx, chunk_line_idx) =
+                        if line_break_idx == 0 {
+                            Chunks::new_with_range_at_byte(
+                                node,
+                                start_info.bytes as usize,
+                                (start_info.bytes as usize, end_info.bytes as usize),
+                                (start_info.chars as usize, end_info.chars as usize),
+                                (
+                                    start_info.line_breaks as usize,
+                                    end_info.line_breaks as usize + 1,
+                                ),
+                            )
+                        } else if line_break_idx == self.len_lines() {
+                            Chunks::new_with_range_at_byte(
+                                node,
+                                end_info.bytes as usize,
+                                (start_info.bytes as usize, end_info.bytes as usize),
+                                (start_info.chars as usize, end_info.chars as usize),
+                                (
+                                    start_info.line_breaks as usize,
+                                    end_info.line_breaks as usize + 1,
+                                ),
+                            )
+                        } else {
+                            Chunks::new_with_range_at_line_break(
+                                node,
+                                line_break_idx + start_info.line_breaks as usize,
+                                (start_info.bytes as usize, end_info.bytes as usize),
+                                (start_info.chars as usize, end_info.chars as usize),
+                                (
+                                    start_info.line_breaks as usize,
+                                    end_info.line_breaks as usize + 1,
+                                ),
+                            )
+                        };
+                    Some((
+                        chunks,
+                        chunk_byte_idx.saturating_sub(start_info.bytes as usize),
+                        chunk_char_idx.saturating_sub(start_info.chars as usize),
+                        chunk_line_idx.saturating_sub(start_info.line_breaks as usize),
+                    ))
+                }
+                RopeSlice(RSEnum::Light {
+                    text,
+                    char_count,
+                    line_break_count,
+                    ..
+                }) => {
+                    let chunks =
+                        Chunks::from_str(text, line_break_idx == line_break_count as usize);
+
+                    if line_break_idx == line_break_count as usize {
+                        Some((
+                            chunks,
+                            text.len(),
+                            char_count as usize,
+                            line_break_count as usize,
+                        ))
+                    } else {
+                        Some((chunks, 0, 0, 0))
+                    }
+                }
+            }
+        } else {
+            None
+        }
     }
 }
 

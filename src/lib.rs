@@ -8,11 +8,11 @@
 //!
 //! The library is made up of four main components:
 //!
-//! - [`Rope`](struct.Rope.html): the main rope type.
-//! - [`RopeSlice`](struct.RopeSlice.html): an immutable view into part of a
+//! - [`Rope`]: the main rope type.
+//! - [`RopeSlice`]: an immutable view into part of a
 //!   `Rope`.
-//! - [`iter`](iter/index.html): iterators over `Rope`/`RopeSlice` data.
-//! - [`RopeBuilder`](struct.RopeBuilder.html): an efficient incremental
+//! - [`iter`]: iterators over `Rope`/`RopeSlice` data.
+//! - [`RopeBuilder`]: an efficient incremental
 //!   `Rope` builder.
 //!
 //!
@@ -74,10 +74,10 @@
 //! code to efficiently work with a `Rope`'s data and implement new
 //! functionality.  The most important of those API's are:
 //!
-//! - The [`chunk_at_*()`](struct.Rope.html#method.chunk_at_byte)
+//! - The [`chunk_at_*()`](Rope::chunk_at_byte)
 //!   chunk-fetching methods of `Rope` and `RopeSlice`.
-//! - The [`Chunks`](iter/struct.Chunks.html) iterator.
-//! - The functions in [`str_utils`](str_utils/index.html) for operating on
+//! - The [`Chunks`](iter::Chunks) iterator.
+//! - The functions in [`str_utils`] for operating on
 //!   `&str` slices.
 //!
 //! Internally, each `Rope` stores text as a segemented collection of utf8
@@ -87,7 +87,7 @@
 //!
 //! The chunk-fetching methods and `str_utils` functions are the basic
 //! building blocks that Ropey itself uses to build much of its functionality.
-//! For example, the [`Rope::byte_to_char()`](struct.Rope.html#method.byte_to_char)
+//! For example, the [`Rope::byte_to_char()`]
 //! method can be reimplemented as a free function like this:
 //!
 //! ```no_run
@@ -126,7 +126,9 @@
 //!
 //! Additionally, Ropey treats line breaks as being a part of the line that
 //! they mark the end of.  That is to say, lines begin immediately _after_ a
-//! line break.
+//! line break.  For example, the text `"Hello\nworld"` has two lines:
+//! `"Hello\n"` and `"world"`.  And the text `"Hello\nworld\n"` has three
+//! lines: `"Hello\n"`, `"world\n"`, and `""`.
 //!
 //! CRLF pairs are always treated as a single line break, and are never split
 //! across chunks.  Note, however, that slicing can still split them.
@@ -148,6 +150,177 @@ mod tree;
 pub mod iter;
 pub mod str_utils;
 
+use std::ops::Bound;
+
 pub use crate::rope::Rope;
 pub use crate::rope_builder::RopeBuilder;
 pub use crate::slice::RopeSlice;
+
+//==============================================================
+// Error reporting types.
+
+/// Ropey's result type.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Ropey's error type.
+#[derive(Clone, Copy)]
+#[non_exhaustive]
+pub enum Error {
+    /// Indicates that the passed byte index was out of bounds.
+    ///
+    /// Contains the index attempted and the actual length of the
+    /// `Rope`/`RopeSlice` in bytes, in that order.
+    ByteIndexOutOfBounds(usize, usize),
+
+    /// Indicates that the passed char index was out of bounds.
+    ///
+    /// Contains the index attempted and the actual length of the
+    /// `Rope`/`RopeSlice` in chars, in that order.
+    CharIndexOutOfBounds(usize, usize),
+
+    /// Indicates that the passed line index was out of bounds.
+    ///
+    /// Contains the index attempted and the actual length of the
+    /// `Rope`/`RopeSlice` in lines, in that order.
+    LineIndexOutOfBounds(usize, usize),
+
+    /// Indicates that the passed utf16 code-unit index was out of
+    /// bounds.
+    ///
+    /// Contains the index attempted and the actual length of the
+    /// `Rope`/`RopeSlice` in utf16 code units, in that order.
+    Utf16IndexOutOfBounds(usize, usize),
+
+    /// Indicates that a reversed char-index range (end < start) was
+    /// encountered.
+    ///
+    /// Contains the [start, end) char indices of the range, in that order.
+    CharRangeInvalid(
+        usize, // Start.
+        usize, // End.
+    ),
+
+    /// Indicates that the passed char-index range was partially or fully
+    /// out of bounds.
+    ///
+    /// Contains the [start, end) char indices of the range and the actual
+    /// length of the `Rope`/`RopeSlice` in chars, in that order.  When
+    /// either the start or end are `None`, that indicates a half-open range.
+    CharRangeOutOfBounds(
+        Option<usize>, // Start.
+        Option<usize>, // End.
+        usize,         // Rope char length.
+    ),
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        None
+    }
+
+    // Deprecated in std.
+    fn description(&self) -> &str {
+        ""
+    }
+
+    // Deprecated in std.
+    fn cause(&self) -> Option<&dyn std::error::Error> {
+        None
+    }
+}
+
+impl std::fmt::Debug for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Error::ByteIndexOutOfBounds(index, len) => {
+                write!(
+                    f,
+                    "Byte index out of bounds: byte index {}, Rope/RopeSlice byte length {}",
+                    index, len
+                )
+            }
+            Error::CharIndexOutOfBounds(index, len) => {
+                write!(
+                    f,
+                    "Char index out of bounds: char index {}, Rope/RopeSlice char length {}",
+                    index, len
+                )
+            }
+            Error::LineIndexOutOfBounds(index, len) => {
+                write!(
+                    f,
+                    "Line index out of bounds: line index {}, Rope/RopeSlice line count {}",
+                    index, len
+                )
+            }
+            Error::Utf16IndexOutOfBounds(index, len) => {
+                write!(f, "Utf16 code-unit index out of bounds: utf16 index {}, Rope/RopeSlice utf16 length {}", index, len)
+            }
+
+            Error::CharRangeInvalid(start_idx, end_idx) => {
+                write!(
+                    f,
+                    "Invalid char range {}..{}: start must be <= end",
+                    start_idx, end_idx
+                )
+            }
+            Error::CharRangeOutOfBounds(start_idx_opt, end_idx_opt, len) => {
+                write!(f, "Char range out of bounds: char range ")?;
+                write_range(f, start_idx_opt, end_idx_opt)?;
+                write!(f, ", Rope/RopeSlice char length {}", len)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Just re-use the debug impl.
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+
+fn write_range(
+    f: &mut std::fmt::Formatter<'_>,
+    start_idx: Option<usize>,
+    end_idx: Option<usize>,
+) -> std::fmt::Result {
+    match (start_idx, end_idx) {
+        (None, None) => {
+            write!(f, "..")
+        }
+
+        (Some(start), None) => {
+            write!(f, "{}..", start)
+        }
+
+        (None, Some(end)) => {
+            write!(f, "..{}", end)
+        }
+
+        (Some(start), Some(end)) => {
+            write!(f, "{}..{}", start, end)
+        }
+    }
+}
+
+//==============================================================
+// Range handling utilities.
+
+#[inline(always)]
+pub(crate) fn start_bound_to_num(b: Bound<&usize>) -> Option<usize> {
+    match b {
+        Bound::Included(n) => Some(*n),
+        Bound::Excluded(n) => Some(*n + 1),
+        Bound::Unbounded => None,
+    }
+}
+
+#[inline(always)]
+pub(crate) fn end_bound_to_num(b: Bound<&usize>) -> Option<usize> {
+    match b {
+        Bound::Included(n) => Some(*n + 1),
+        Bound::Excluded(n) => Some(*n),
+        Bound::Unbounded => None,
+    }
+}

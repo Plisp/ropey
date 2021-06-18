@@ -7,12 +7,13 @@ use std::sync::Arc;
 use crate::crlf;
 use crate::iter::{Bytes, Chars, Chunks, Lines};
 use crate::rope_builder::RopeBuilder;
-use crate::slice::{end_bound_to_num, start_bound_to_num, RopeSlice};
+use crate::slice::RopeSlice;
 use crate::str_utils::{
     byte_to_char_idx, byte_to_line_idx, char_to_byte_idx,
     char_to_line_idx, line_to_byte_idx, line_to_char_idx, utf16_code_unit_to_char_idx,
 };
-use crate::tree::{Count, Node, NodeChildren, NodeText, TextInfo, MAX_BYTES};
+use crate::tree::{Count, Node, NodeText, NodeChildren, TextInfo, MAX_BYTES, MIN_BYTES};
+use crate::{end_bound_to_num, start_bound_to_num, Error, Result};
 
 /// A utf8 text rope.
 ///
@@ -106,8 +107,13 @@ impl Rope {
 
     /// Creates a `Rope` from the output of a reader.
     ///
-    /// This is a convenience function.  To do more sophisticated text loading,
-    /// see [`RopeBuilder`](struct.RopeBuilder.html).
+    /// This is a convenience function, and provides *no specific guarantees*
+    /// about performance or internal implementation aside from the runtime
+    /// complexity listed below.
+    ///
+    /// When more precise control over IO behavior, buffering, etc. is desired,
+    /// you should handle IO yourself and use [`RopeBuilder`] to build the
+    /// `Rope`.
     ///
     /// Runs in O(N) time.
     ///
@@ -201,8 +207,13 @@ impl Rope {
 
     /// Writes the contents of the `Rope` to a writer.
     ///
-    /// This is a convenience function.  To do more sophisticated text output,
-    /// see the [`Chunks`](iter/struct.Chunks.html) iterator.
+    /// This is a convenience function, and provides *no specific guarantees*
+    /// about performance or internal implementation aside from the runtime
+    /// complexity listed below.
+    ///
+    /// When more precise control over IO behavior, buffering, etc. is
+    /// desired, you should handle IO yourself and use the [`Chunks`]
+    /// iterator to iterate through the `Rope`'s contents.
     ///
     /// Runs in O(N) time.
     ///
@@ -342,57 +353,7 @@ impl Rope {
     #[inline]
     pub fn insert(&mut self, char_idx: usize, text: &str) {
         // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to insert past end of Rope: insertion point {}, Rope length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        // We have three cases here:
-        // 1. The insertion text is very large, in which case building a new
-        //    Rope out of it and splicing it into the existing Rope is most
-        //    efficient.
-        // 2. The insertion text is somewhat large, in which case splitting it
-        //    up into chunks and repeatedly inserting them is the most
-        //    efficient.  The splitting is necessary because the insertion code
-        //    only works correctly below a certain insertion size.
-        // 3. The insertion text is small, in which case we can simply insert
-        //    it.
-        //
-        // Cases #2 and #3 are rolled into one case here, where case #3 just
-        // results in the text being "split" into only one chunk.
-        //
-        // The boundary for what constitutes "very large" text was arrived at
-        // experimentally, by testing at what point Rope build + splice becomes
-        // faster than split + repeated insert.  This constant is likely worth
-        // revisiting from time to time as Ropey evolves.
-        if text.len() > MAX_BYTES * 6 {
-            // Case #1: very large text, build rope and splice it in.
-            let text_rope = Rope::from_str(text);
-            let right = self.split_off(char_idx);
-            self.append(text_rope);
-            self.append(right);
-        } else {
-            // Cases #2 and #3: split into chunks and repeatedly insert.
-            let mut text = text;
-            while !text.is_empty() {
-                // Split a chunk off from the end of the text.
-                // We do this from the end instead of the front so that
-                // the repeated insertions can keep re-using the same
-                // insertion point.
-                let split_idx = crlf::find_good_split(
-                    text.len() - (MAX_BYTES - 4).min(text.len()),
-                    text.as_bytes(),
-                    false,
-                );
-                let ins_text = &text[split_idx..];
-                text = &text[..split_idx];
-
-                // Do the insertion.
-                self.insert_internal(char_idx, ins_text);
-            }
-        }
+        self.try_insert(char_idx, text).unwrap()
     }
 
     /// Inserts a single char `ch` at char index `char_idx`.
@@ -404,16 +365,7 @@ impl Rope {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn insert_char(&mut self, char_idx: usize, ch: char) {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to insert past end of Rope: insertion point {}, Rope length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        let mut buf = [0u8; 4];
-        self.insert_internal(char_idx, ch.encode_utf8(&mut buf));
+        self.try_insert_char(char_idx, ch).unwrap()
     }
 
     /// Private internal-only method that does a single insertion of
@@ -593,43 +545,7 @@ impl Rope {
     where
         R: RangeBounds<usize>,
     {
-        let start = start_bound_to_num(char_range.start_bound()).unwrap_or(0);
-        let end = end_bound_to_num(char_range.end_bound()).unwrap_or_else(|| self.len_chars());
-
-        // Bounds check
-        assert!(start <= end);
-        assert!(
-            end <= self.len_chars(),
-            "Attempt to remove past end of Rope: removal end {}, Rope length {}",
-            end,
-            self.len_chars()
-        );
-
-        // A special case that the rest of the logic doesn't handle
-        // correctly.
-        if start == 0 && end == self.len_chars() {
-            self.root = Arc::new(Node::new());
-            return;
-        }
-
-        // Scope to contain borrow of root
-        {
-            let root = Arc::make_mut(&mut self.root);
-
-            let root_info = root.text_info();
-            let (_, crlf_seam, needs_fix) = root.remove_char_range(start, end, root_info);
-
-            if crlf_seam {
-                let seam_idx = root.char_to_text_info(start).bytes;
-                root.fix_crlf_seam(seam_idx as Count, false);
-            }
-
-            if needs_fix {
-                root.fix_after_remove(start);
-            }
-        }
-
-        self.pull_up_singular_nodes();
+        self.try_remove(char_range).unwrap()
     }
 
     /// Splits the `Rope` at `char_idx`, returning the right part of
@@ -641,36 +557,7 @@ impl Rope {
     ///
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     pub fn split_off(&mut self, char_idx: usize) -> Self {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to split past end of Rope: split point {}, Rope length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        if char_idx == 0 {
-            // Special case 1
-            let mut new_rope = Rope::new();
-            std::mem::swap(self, &mut new_rope);
-            new_rope
-        } else if char_idx == self.len_chars() {
-            // Special case 2
-            Rope::new()
-        } else {
-            // Do the split
-            let mut new_rope = Rope {
-                root: Arc::new(Arc::make_mut(&mut self.root).split(char_idx)),
-            };
-
-            // Fix up the edges
-            Arc::make_mut(&mut self.root).zip_fix_right();
-            Arc::make_mut(&mut new_rope.root).zip_fix_left();
-            self.pull_up_singular_nodes();
-            new_rope.pull_up_singular_nodes();
-
-            new_rope
-        }
+        self.try_split_off(char_idx).unwrap()
     }
 
     /// Appends a `Rope` to the end of this one, consuming the other `Rope`.
@@ -682,8 +569,11 @@ impl Rope {
             let mut other = other;
             std::mem::swap(self, &mut other);
         } else if other.len_chars() > 0 {
+            let left_info = self.root.text_info();
+            let right_info = other.root.text_info();
+
             let seam_byte_i = if other.char(0) == '\n' {
-                Some(self.root.text_info().bytes)
+                Some(left_info.bytes)
             } else {
                 None
             };
@@ -713,9 +603,15 @@ impl Rope {
                 *self = other;
             };
 
+            // Fix up any mess left behind.
+            let root = Arc::make_mut(&mut self.root);
             if let Some(i) = seam_byte_i {
-                Arc::make_mut(&mut self.root).fix_crlf_seam(i, true);
+                root.fix_crlf_seam(i, true);
             }
+            if (left_info.bytes as usize) < MIN_BYTES || (right_info.bytes as usize) < MIN_BYTES {
+                root.fix_tree_seam(left_info.chars as usize);
+            }
+            self.pull_up_singular_nodes();
         }
     }
 
@@ -738,16 +634,7 @@ impl Rope {
     /// Panics if `byte_idx` is out of bounds (i.e. `byte_idx > len_bytes()`).
     #[inline]
     pub fn byte_to_char(&self, byte_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        let (chunk, b, c, _) = self.chunk_at_byte(byte_idx);
-        c + byte_to_char_idx(chunk, byte_idx - b)
+        self.try_byte_to_char(byte_idx).unwrap()
     }
 
     /// Returns the line index of the given byte.
@@ -766,16 +653,7 @@ impl Rope {
     /// Panics if `byte_idx` is out of bounds (i.e. `byte_idx > len_bytes()`).
     #[inline]
     pub fn byte_to_line(&self, byte_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        let (chunk, b, _, l) = self.chunk_at_byte(byte_idx);
-        l + byte_to_line_idx(chunk, byte_idx - b)
+        self.try_byte_to_line(byte_idx).unwrap()
     }
 
     /// Returns the byte index of the given char.
@@ -792,16 +670,7 @@ impl Rope {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn char_to_byte(&self, char_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of Rope: char index {}, Rope char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        let (chunk, b, c, _) = self.chunk_at_char(char_idx);
-        b + char_to_byte_idx(chunk, char_idx - c)
+        self.try_char_to_byte(char_idx).unwrap()
     }
 
     /// Returns the line index of the given char.
@@ -820,16 +689,7 @@ impl Rope {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn char_to_line(&self, char_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of Rope: char index {}, Rope char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        let (chunk, _, c, l) = self.chunk_at_char(char_idx);
-        l + char_to_line_idx(chunk, char_idx - c)
+        self.try_char_to_line(char_idx).unwrap()
     }
 
     /// Returns the utf16 code unit index of the given char.
@@ -846,15 +706,7 @@ impl Rope {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn char_to_utf16_cu(&self, char_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of Rope: char index {}, Rope char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        char_idx
+        self.try_char_to_utf16_cu(char_idx).unwrap()
     }
 
     /// Returns the char index of the given utf16 code unit.
@@ -875,19 +727,7 @@ impl Rope {
     /// (i.e. `utf16_cu_idx > len_utf16_cu()`).
     #[inline]
     pub fn utf16_cu_to_char(&self, utf16_cu_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            utf16_cu_idx <= self.len_utf16_cu(),
-            "Attempt to index past end of Rope: utf16 code unit index {}, Rope utf16 code unit length {}",
-            utf16_cu_idx,
-            self.len_utf16_cu()
-        );
-
-        let (chunk, chunk_start_info) = self.root.get_chunk_at_utf16_code_unit(utf16_cu_idx);
-        let chunk_utf16_cu_idx = utf16_cu_idx - chunk_start_info.chars as usize;
-        let chunk_char_idx = utf16_code_unit_to_char_idx(chunk, chunk_utf16_cu_idx);
-
-        chunk_start_info.chars as usize + chunk_char_idx
+        self.try_utf16_cu_to_char(utf16_cu_idx).unwrap()
     }
 
     /// Returns the byte index of the start of the given line.
@@ -905,20 +745,7 @@ impl Rope {
     /// Panics if `line_idx` is out of bounds (i.e. `line_idx > len_lines()`).
     #[inline]
     pub fn line_to_byte(&self, line_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            line_idx <= self.len_lines(),
-            "Attempt to index past end of Rope: line index {}, Rope line length {}",
-            line_idx,
-            self.len_lines()
-        );
-
-        if line_idx == self.len_lines() {
-            self.len_bytes()
-        } else {
-            let (chunk, b, _, l) = self.chunk_at_line_break(line_idx);
-            b + line_to_byte_idx(chunk, line_idx - l)
-        }
+        self.try_line_to_byte(line_idx).unwrap()
     }
 
     /// Returns the char index of the start of the given line.
@@ -936,20 +763,7 @@ impl Rope {
     /// Panics if `line_idx` is out of bounds (i.e. `line_idx > len_lines()`).
     #[inline]
     pub fn line_to_char(&self, line_idx: usize) -> usize {
-        // Bounds check
-        assert!(
-            line_idx <= self.len_lines(),
-            "Attempt to index past end of Rope: line index {}, Rope line length {}",
-            line_idx,
-            self.len_lines()
-        );
-
-        if line_idx == self.len_lines() {
-            self.len_chars()
-        } else {
-            let (chunk, _, c, l) = self.chunk_at_line_break(line_idx);
-            c + line_to_char_idx(chunk, line_idx - l)
-        }
+        self.try_line_to_char(line_idx).unwrap()
     }
 
     //-----------------------------------------------------------------------
@@ -965,16 +779,15 @@ impl Rope {
     #[inline]
     pub fn byte(&self, byte_idx: usize) -> u8 {
         // Bounds check
-        assert!(
-            byte_idx < self.len_bytes(),
-            "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        let (chunk, chunk_byte_idx, _, _) = self.chunk_at_byte(byte_idx);
-        let chunk_rel_byte_idx = byte_idx - chunk_byte_idx;
-        chunk.as_bytes()[chunk_rel_byte_idx]
+        if let Some(out) = self.get_byte(byte_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
+                byte_idx,
+                self.len_bytes()
+            );
+        }
     }
 
     /// Returns the char at `char_idx`.
@@ -986,17 +799,15 @@ impl Rope {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx >= len_chars()`).
     #[inline]
     pub fn char(&self, char_idx: usize) -> char {
-        // Bounds check
-        assert!(
-            char_idx < self.len_chars(),
-            "Attempt to index past end of Rope: char index {}, Rope char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        let (chunk, _, chunk_char_idx, _) = self.chunk_at_char(char_idx);
-        let byte_idx = char_to_byte_idx(chunk, char_idx - chunk_char_idx);
-        chunk[byte_idx..].chars().next().unwrap()
+        if let Some(out) = self.get_char(char_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: char index {}, Rope char length {}",
+                char_idx,
+                self.len_chars()
+            );
+        }
     }
 
     /// Returns the line at `line_idx`.
@@ -1010,33 +821,14 @@ impl Rope {
     /// Panics if `line_idx` is out of bounds (i.e. `line_idx >= len_lines()`).
     #[inline]
     pub fn line(&self, line_idx: usize) -> RopeSlice {
-        use crate::slice::RSEnum;
-        use crate::str_utils::{count_chars};
-
-        let len_lines = self.len_lines();
-
-        // Bounds check
-        assert!(
-            line_idx < len_lines,
-            "Attempt to index past end of Rope: line index {}, Rope line length {}",
-            line_idx,
-            len_lines
-        );
-
-        let (chunk_1, _, c1, l1) = self.chunk_at_line_break(line_idx);
-        let (chunk_2, _, c2, l2) = self.chunk_at_line_break(line_idx + 1);
-        if c1 == c2 {
-            let text1 = &chunk_1[line_to_byte_idx(chunk_1, line_idx - l1)..];
-            let text2 = &text1[..line_to_byte_idx(text1, 1)];
-            RopeSlice(RSEnum::Light {
-                text: text2,
-                char_count: count_chars(text2) as Count,
-                line_break_count: if line_idx == (len_lines - 1) { 0 } else { 1 },
-            })
+        if let Some(out) = self.get_line(line_idx) {
+            out
         } else {
-            let start = c1 + line_to_char_idx(chunk_1, line_idx - l1);
-            let end = c2 + line_to_char_idx(chunk_2, line_idx + 1 - l2);
-            self.slice(start..end)
+            let len_lines = self.len_lines();
+            panic!(
+                "Attempt to index past end of Rope: line index {}, Rope line length {}",
+                line_idx, len_lines
+            );
         }
     }
 
@@ -1059,20 +851,15 @@ impl Rope {
     #[inline]
     pub fn chunk_at_byte(&self, byte_idx: usize) -> (&str, usize, usize, usize) {
         // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        let (chunk, info) = self.root.get_chunk_at_byte(byte_idx);
-        (
-            chunk,
-            info.bytes as usize,
-            info.chars as usize,
-            info.line_breaks as usize,
-        )
+        if let Some(out) = self.get_chunk_at_byte(byte_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
+                byte_idx,
+                self.len_bytes()
+            );
+        }
     }
 
     /// Returns the chunk containing the given char index.
@@ -1093,21 +880,15 @@ impl Rope {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn chunk_at_char(&self, char_idx: usize) -> (&str, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of Rope: char index {}, Rope char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        let (chunk, info) = self.root.get_chunk_at_char(char_idx);
-        (
-            chunk,
-            info.bytes as usize,
-            info.chars as usize,
-            info.line_breaks as usize,
-        )
+        if let Some(out) = self.get_chunk_at_char(char_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: char index {}, Rope char length {}",
+                char_idx,
+                self.len_chars()
+            );
+        }
     }
 
     /// Returns the chunk containing the given line break.
@@ -1131,21 +912,15 @@ impl Rope {
     /// Panics if `line_break_idx` is out of bounds (i.e. `line_break_idx > len_lines()`).
     #[inline]
     pub fn chunk_at_line_break(&self, line_break_idx: usize) -> (&str, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            line_break_idx <= self.len_lines(),
-            "Attempt to index past end of Rope: line break index {}, max index {}",
-            line_break_idx,
-            self.len_lines()
-        );
-
-        let (chunk, info) = self.root.get_chunk_at_line_break(line_break_idx);
-        (
-            chunk,
-            info.bytes as usize,
-            info.chars as usize,
-            info.line_breaks as usize,
-        )
+        if let Some(out) = self.get_chunk_at_line_break(line_break_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: line break index {}, max index {}",
+                line_break_idx,
+                self.len_lines()
+            );
+        }
     }
 
     //-----------------------------------------------------------------------
@@ -1176,19 +951,7 @@ impl Rope {
     where
         R: RangeBounds<usize>,
     {
-        let start = start_bound_to_num(char_range.start_bound()).unwrap_or(0);
-        let end = end_bound_to_num(char_range.end_bound()).unwrap_or_else(|| self.len_chars());
-
-        // Bounds check
-        assert!(start <= end);
-        assert!(
-            end <= self.len_chars(),
-            "Attempt to slice past end of Rope: slice end {}, Rope length {}",
-            end,
-            self.len_chars()
-        );
-
-        RopeSlice::new_with_range(&self.root, start, end)
+        self.get_slice(char_range).unwrap()
     }
 
     //-----------------------------------------------------------------------
@@ -1215,22 +978,15 @@ impl Rope {
     /// Panics if `byte_idx` is out of bounds (i.e. `byte_idx > len_bytes()`).
     #[inline]
     pub fn bytes_at(&self, byte_idx: usize) -> Bytes {
-        // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        let info = self.root.text_info();
-        Bytes::new_with_range_at(
-            &self.root,
-            byte_idx,
-            (0, info.bytes as usize),
-            (0, info.chars as usize),
-            (0, info.line_breaks as usize + 1),
-        )
+        if let Some(out) = self.get_bytes_at(byte_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
+                byte_idx,
+                self.len_bytes()
+            );
+        }
     }
 
     /// Creates an iterator over the chars of the `Rope`.
@@ -1254,22 +1010,15 @@ impl Rope {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn chars_at(&self, char_idx: usize) -> Chars {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of Rope: char index {}, Rope char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        let info = self.root.text_info();
-        Chars::new_with_range_at(
-            &self.root,
-            char_idx,
-            (0, info.bytes as usize),
-            (0, info.chars as usize),
-            (0, info.line_breaks as usize + 1),
-        )
+        if let Some(out) = self.get_chars_at(char_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: char index {}, Rope char length {}",
+                char_idx,
+                self.len_chars()
+            );
+        }
     }
 
     /// Creates an iterator over the lines of the `Rope`.
@@ -1293,20 +1042,15 @@ impl Rope {
     /// Panics if `line_idx` is out of bounds (i.e. `line_idx > len_lines()`).
     #[inline]
     pub fn lines_at(&self, line_idx: usize) -> Lines {
-        // Bounds check
-        assert!(
-            line_idx <= self.len_lines(),
-            "Attempt to index past end of Rope: line index {}, Rope line length {}",
-            line_idx,
-            self.len_lines()
-        );
-
-        Lines::new_with_range_at(
-            &self.root,
-            line_idx,
-            (0, self.len_bytes()),
-            (0, self.len_lines()),
-        )
+        if let Some(out) = self.get_lines_at(line_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: line index {}, Rope line length {}",
+                line_idx,
+                self.len_lines()
+            );
+        }
     }
 
     /// Creates an iterator over the chunks of the `Rope`.
@@ -1336,21 +1080,15 @@ impl Rope {
     /// Panics if `byte_idx` is out of bounds (i.e. `byte_idx > len_bytes()`).
     #[inline]
     pub fn chunks_at_byte(&self, byte_idx: usize) -> (Chunks, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            byte_idx <= self.len_bytes(),
-            "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
-            byte_idx,
-            self.len_bytes()
-        );
-
-        Chunks::new_with_range_at_byte(
-            &self.root,
-            byte_idx,
-            (0, self.len_bytes()),
-            (0, self.len_chars()),
-            (0, self.len_lines()),
-        )
+        if let Some(out) = self.get_chunks_at_byte(byte_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: byte index {}, Rope byte length {}",
+                byte_idx,
+                self.len_bytes()
+            );
+        }
     }
 
     /// Creates an iterator over the chunks of the `Rope`, with the
@@ -1372,21 +1110,15 @@ impl Rope {
     /// Panics if `char_idx` is out of bounds (i.e. `char_idx > len_chars()`).
     #[inline]
     pub fn chunks_at_char(&self, char_idx: usize) -> (Chunks, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            char_idx <= self.len_chars(),
-            "Attempt to index past end of Rope: char index {}, Rope char length {}",
-            char_idx,
-            self.len_chars()
-        );
-
-        Chunks::new_with_range_at_char(
-            &self.root,
-            char_idx,
-            (0, self.len_bytes()),
-            (0, self.len_chars()),
-            (0, self.len_lines()),
-        )
+        if let Some(out) = self.get_chunks_at_char(char_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: char index {}, Rope char length {}",
+                char_idx,
+                self.len_chars()
+            );
+        }
     }
 
     /// Creates an iterator over the chunks of the `Rope`, with the
@@ -1412,21 +1144,15 @@ impl Rope {
     /// Panics if `line_break_idx` is out of bounds (i.e. `line_break_idx > len_lines()`).
     #[inline]
     pub fn chunks_at_line_break(&self, line_break_idx: usize) -> (Chunks, usize, usize, usize) {
-        // Bounds check
-        assert!(
-            line_break_idx <= self.len_lines(),
-            "Attempt to index past end of Rope: line break index {}, max index {}",
-            line_break_idx,
-            self.len_lines()
-        );
-
-        Chunks::new_with_range_at_line_break(
-            &self.root,
-            line_break_idx,
-            (0, self.len_bytes()),
-            (0, self.len_chars()),
-            (0, self.len_lines()),
-        )
+        if let Some(out) = self.get_chunks_at_line_break(line_break_idx) {
+            out
+        } else {
+            panic!(
+                "Attempt to index past end of Rope: line break index {}, max index {}",
+                line_break_idx,
+                self.len_lines()
+            );
+        }
     }
 
     //-----------------------------------------------------------------------
@@ -1503,6 +1229,498 @@ impl Rope {
             };
 
             self.root = child;
+        }
+    }
+}
+
+/// # Non-Panicking
+///
+/// The methods in this impl block provide non-panicking versions of
+/// `Rope`'s panicking methods.  They return either `Option::None` or
+/// `Result::Err()` when their panicking counterparts would have panicked.
+impl Rope {
+    /// Non-panicking version of [`insert()`](Rope::insert).
+    #[inline]
+    pub fn try_insert(&mut self, char_idx: usize, text: &str) -> Result<()> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            // We have three cases here:
+            // 1. The insertion text is very large, in which case building a new
+            //    Rope out of it and splicing it into the existing Rope is most
+            //    efficient.
+            // 2. The insertion text is somewhat large, in which case splitting it
+            //    up into chunks and repeatedly inserting them is the most
+            //    efficient.  The splitting is necessary because the insertion code
+            //    only works correctly below a certain insertion size.
+            // 3. The insertion text is small, in which case we can simply insert
+            //    it.
+            //
+            // Cases #2 and #3 are rolled into one case here, where case #3 just
+            // results in the text being "split" into only one chunk.
+            //
+            // The boundary for what constitutes "very large" text was arrived at
+            // experimentally, by testing at what point Rope build + splice becomes
+            // faster than split + repeated insert.  This constant is likely worth
+            // revisiting from time to time as Ropey evolves.
+            if text.len() > MAX_BYTES * 6 {
+                // Case #1: very large text, build rope and splice it in.
+                let text_rope = Rope::from_str(text);
+                let right = self.split_off(char_idx);
+                self.append(text_rope);
+                self.append(right);
+            } else {
+                // Cases #2 and #3: split into chunks and repeatedly insert.
+                let mut text = text;
+                while !text.is_empty() {
+                    // Split a chunk off from the end of the text.
+                    // We do this from the end instead of the front so that
+                    // the repeated insertions can keep re-using the same
+                    // insertion point.
+                    let split_idx = crlf::find_good_split(
+                        text.len() - (MAX_BYTES - 4).min(text.len()),
+                        text.as_bytes(),
+                        false,
+                    );
+                    let ins_text = &text[split_idx..];
+                    text = &text[..split_idx];
+
+                    // Do the insertion.
+                    self.insert_internal(char_idx, ins_text);
+                }
+            }
+            Ok(())
+        } else {
+            Err(Error::CharIndexOutOfBounds(char_idx, self.len_chars()))
+        }
+    }
+
+    /// Non-panicking version of [`insert_char()`](Rope::insert_char).
+    #[inline]
+    pub fn try_insert_char(&mut self, char_idx: usize, ch: char) -> Result<()> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            let mut buf = [0u8; 4];
+            Ok(self.insert_internal(char_idx, ch.encode_utf8(&mut buf)))
+        } else {
+            Err(Error::CharIndexOutOfBounds(char_idx, self.len_chars()))
+        }
+    }
+
+    /// Non-panicking version of [`remove()`](Rope::remove).
+    pub fn try_remove<R>(&mut self, char_range: R) -> Result<()>
+    where
+        R: RangeBounds<usize>,
+    {
+        let start_opt = start_bound_to_num(char_range.start_bound());
+        let end_opt = end_bound_to_num(char_range.end_bound());
+        let start = start_opt.unwrap_or(0);
+        let end = end_opt.unwrap_or_else(|| self.len_chars());
+        if !(end.max(start) <= self.len_chars()) {
+            Err(Error::CharRangeOutOfBounds(
+                start_opt,
+                end_opt,
+                self.len_chars(),
+            ))
+        } else if !(start <= end) {
+            Err(Error::CharRangeInvalid(start, end))
+        } else {
+            // A special case that the rest of the logic doesn't handle
+            // correctly.
+            if start == 0 && end == self.len_chars() {
+                self.root = Arc::new(Node::new());
+                return Ok(());
+            }
+
+            let root = Arc::make_mut(&mut self.root);
+
+            let root_info = root.text_info();
+            let (_, crlf_seam, needs_fix) = root.remove_char_range(start, end, root_info);
+
+            if crlf_seam {
+                let seam_idx = root.char_to_text_info(start).bytes;
+                root.fix_crlf_seam(seam_idx as Count, false);
+            }
+
+            if needs_fix {
+                root.fix_tree_seam(start);
+            }
+
+            self.pull_up_singular_nodes();
+            Ok(())
+        }
+    }
+
+    /// Non-panicking version of [`split_off()`](Rope::split_off).
+    pub fn try_split_off(&mut self, char_idx: usize) -> Result<Self> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            if char_idx == 0 {
+                // Special case 1
+                let mut new_rope = Rope::new();
+                std::mem::swap(self, &mut new_rope);
+                Ok(new_rope)
+            } else if char_idx == self.len_chars() {
+                // Special case 2
+                Ok(Rope::new())
+            } else {
+                // Do the split
+                let mut new_rope = Rope {
+                    root: Arc::new(Arc::make_mut(&mut self.root).split(char_idx)),
+                };
+
+                // Fix up the edges
+                Arc::make_mut(&mut self.root).zip_fix_right();
+                Arc::make_mut(&mut new_rope.root).zip_fix_left();
+                self.pull_up_singular_nodes();
+                new_rope.pull_up_singular_nodes();
+
+                Ok(new_rope)
+            }
+        } else {
+            Err(Error::CharIndexOutOfBounds(char_idx, self.len_chars()))
+        }
+    }
+
+    /// Non-panicking version of [`byte_to_char()`](Rope::byte_to_char).
+    #[inline]
+    pub fn try_byte_to_char(&self, byte_idx: usize) -> Result<usize> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            let (chunk, b, c, _) = self.chunk_at_byte(byte_idx);
+            Ok(c + byte_to_char_idx(chunk, byte_idx - b))
+        } else {
+            Err(Error::ByteIndexOutOfBounds(byte_idx, self.len_bytes()))
+        }
+    }
+
+    /// Non-panicking version of [`byte_to_line()`](Rope::byte_to_line).
+    #[inline]
+    pub fn try_byte_to_line(&self, byte_idx: usize) -> Result<usize> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            let (chunk, b, _, l) = self.chunk_at_byte(byte_idx);
+            Ok(l + byte_to_line_idx(chunk, byte_idx - b))
+        } else {
+            Err(Error::ByteIndexOutOfBounds(byte_idx, self.len_bytes()))
+        }
+    }
+
+    /// Non-panicking version of [`char_to_byte()`](Rope::char_to_byte).
+    #[inline]
+    pub fn try_char_to_byte(&self, char_idx: usize) -> Result<usize> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            let (chunk, b, c, _) = self.chunk_at_char(char_idx);
+            Ok(b + char_to_byte_idx(chunk, char_idx - c))
+        } else {
+            Err(Error::CharIndexOutOfBounds(char_idx, self.len_chars()))
+        }
+    }
+
+    /// Non-panicking version of [`char_to_line()`](Rope::char_to_line).
+    #[inline]
+    pub fn try_char_to_line(&self, char_idx: usize) -> Result<usize> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            let (chunk, _, c, l) = self.chunk_at_char(char_idx);
+            Ok(l + char_to_line_idx(chunk, char_idx - c))
+        } else {
+            Err(Error::CharIndexOutOfBounds(char_idx, self.len_chars()))
+        }
+    }
+
+    /// Non-panicking version of [`char_to_utf16_cu()`](Rope::char_to_utf16_cu).
+    #[inline]
+    pub fn try_char_to_utf16_cu(&self, char_idx: usize) -> Result<usize> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            Ok(char_idx)
+        } else {
+            Err(Error::CharIndexOutOfBounds(char_idx, self.len_chars()))
+        }
+    }
+
+    /// Non-panicking version of [`utf16_cu_to_char()`](Rope::utf16_cu_to_char).
+    #[inline]
+    pub fn try_utf16_cu_to_char(&self, utf16_cu_idx: usize) -> Result<usize> {
+        // Bounds check
+        if utf16_cu_idx <= self.len_utf16_cu() {
+            let (chunk, chunk_start_info) = self.root.get_chunk_at_utf16_code_unit(utf16_cu_idx);
+            let chunk_utf16_cu_idx = utf16_cu_idx
+                - (chunk_start_info.chars) as usize;
+            let chunk_char_idx = utf16_code_unit_to_char_idx(chunk, chunk_utf16_cu_idx);
+
+            Ok(chunk_start_info.chars as usize + chunk_char_idx)
+        } else {
+            Err(Error::Utf16IndexOutOfBounds(
+                utf16_cu_idx,
+                self.len_utf16_cu(),
+            ))
+        }
+    }
+
+    /// Non-panicking version of [`line_to_byte()`](Rope::line_to_byte).
+    #[inline]
+    pub fn try_line_to_byte(&self, line_idx: usize) -> Result<usize> {
+        // Bounds check
+        if line_idx <= self.len_lines() {
+            if line_idx == self.len_lines() {
+                Ok(self.len_bytes())
+            } else {
+                let (chunk, b, _, l) = self.chunk_at_line_break(line_idx);
+                Ok(b + line_to_byte_idx(chunk, line_idx - l))
+            }
+        } else {
+            Err(Error::LineIndexOutOfBounds(line_idx, self.len_lines()))
+        }
+    }
+
+    /// Non-panicking version of [`line_to_char()`](Rope::line_to_char).
+    #[inline]
+    pub fn try_line_to_char(&self, line_idx: usize) -> Result<usize> {
+        // Bounds check
+        if line_idx <= self.len_lines() {
+            if line_idx == self.len_lines() {
+                Ok(self.len_chars())
+            } else {
+                let (chunk, _, c, l) = self.chunk_at_line_break(line_idx);
+                Ok(c + line_to_char_idx(chunk, line_idx - l))
+            }
+        } else {
+            Err(Error::LineIndexOutOfBounds(line_idx, self.len_lines()))
+        }
+    }
+
+    /// Non-panicking version of [`byte()`](Rope::byte).
+    #[inline]
+    pub fn get_byte(&self, byte_idx: usize) -> Option<u8> {
+        // Bounds check
+        if byte_idx < self.len_bytes() {
+            let (chunk, chunk_byte_idx, _, _) = self.chunk_at_byte(byte_idx);
+            let chunk_rel_byte_idx = byte_idx - chunk_byte_idx;
+            Some(chunk.as_bytes()[chunk_rel_byte_idx])
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`char()`](Rope::char).
+    #[inline]
+    pub fn get_char(&self, char_idx: usize) -> Option<char> {
+        // Bounds check
+        if char_idx < self.len_chars() {
+            let (chunk, _, chunk_char_idx, _) = self.chunk_at_char(char_idx);
+            let byte_idx = char_to_byte_idx(chunk, char_idx - chunk_char_idx);
+            Some(chunk[byte_idx..].chars().next().unwrap())
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`line()`](Rope::line).
+    #[inline]
+    pub fn get_line(&self, line_idx: usize) -> Option<RopeSlice> {
+        use crate::slice::RSEnum;
+        use crate::str_utils::{count_chars};
+
+        let len_lines = self.len_lines();
+
+        // Bounds check
+        if line_idx < len_lines {
+            let (chunk_1, _, c1, l1) = self.chunk_at_line_break(line_idx);
+            let (chunk_2, _, c2, l2) = self.chunk_at_line_break(line_idx + 1);
+            if c1 == c2 {
+                let text1 = &chunk_1[line_to_byte_idx(chunk_1, line_idx - l1)..];
+                let text2 = &text1[..line_to_byte_idx(text1, 1)];
+                Some(RopeSlice(RSEnum::Light {
+                    text: text2,
+                    char_count: count_chars(text2) as Count,
+                    line_break_count: if line_idx == (len_lines - 1) { 0 } else { 1 },
+                }))
+            } else {
+                let start = c1 + line_to_char_idx(chunk_1, line_idx - l1);
+                let end = c2 + line_to_char_idx(chunk_2, line_idx + 1 - l2);
+                Some(self.slice(start..end))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunk_at_byte()`](Rope::chunk_at_byte).
+    #[inline]
+    pub fn get_chunk_at_byte(&self, byte_idx: usize) -> Option<(&str, usize, usize, usize)> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            let (chunk, info) = self.root.get_chunk_at_byte(byte_idx);
+            Some((
+                chunk,
+                info.bytes as usize,
+                info.chars as usize,
+                info.line_breaks as usize,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunk_at_char()`](Rope::chunk_at_char).
+    #[inline]
+    pub fn get_chunk_at_char(&self, char_idx: usize) -> Option<(&str, usize, usize, usize)> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            let (chunk, info) = self.root.get_chunk_at_char(char_idx);
+            Some((
+                chunk,
+                info.bytes as usize,
+                info.chars as usize,
+                info.line_breaks as usize,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunk_at_line_break()`](Rope::chunk_at_line_break).
+    #[inline]
+    pub fn get_chunk_at_line_break(
+        &self,
+        line_break_idx: usize,
+    ) -> Option<(&str, usize, usize, usize)> {
+        // Bounds check
+        if line_break_idx <= self.len_lines() {
+            let (chunk, info) = self.root.get_chunk_at_line_break(line_break_idx);
+            Some((
+                chunk,
+                info.bytes as usize,
+                info.chars as usize,
+                info.line_breaks as usize,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`slice()`](Rope::slice).
+    #[inline]
+    pub fn get_slice<R>(&self, char_range: R) -> Option<RopeSlice>
+    where
+        R: RangeBounds<usize>,
+    {
+        let start = start_bound_to_num(char_range.start_bound()).unwrap_or(0);
+        let end = end_bound_to_num(char_range.end_bound()).unwrap_or_else(|| self.len_chars());
+
+        // Bounds check
+        if start <= end && end <= self.len_chars() {
+            Some(RopeSlice::new_with_range(&self.root, start, end))
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`bytes_at()`](Rope::bytes_at).
+    #[inline]
+    pub fn get_bytes_at(&self, byte_idx: usize) -> Option<Bytes> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            let info = self.root.text_info();
+            Some(Bytes::new_with_range_at(
+                &self.root,
+                byte_idx,
+                (0, info.bytes as usize),
+                (0, info.chars as usize),
+                (0, info.line_breaks as usize + 1),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chars_at()`](Rope::chars_at).
+    #[inline]
+    pub fn get_chars_at(&self, char_idx: usize) -> Option<Chars> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            let info = self.root.text_info();
+            Some(Chars::new_with_range_at(
+                &self.root,
+                char_idx,
+                (0, info.bytes as usize),
+                (0, info.chars as usize),
+                (0, info.line_breaks as usize + 1),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`lines_at()`](Rope::lines_at).
+    #[inline]
+    pub fn get_lines_at(&self, line_idx: usize) -> Option<Lines> {
+        // Bounds check
+        if line_idx <= self.len_lines() {
+            Some(Lines::new_with_range_at(
+                &self.root,
+                line_idx,
+                (0, self.len_bytes()),
+                (0, self.len_lines()),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunks_at_byte()`](Rope::chunks_at_byte).
+    #[inline]
+    pub fn get_chunks_at_byte(&self, byte_idx: usize) -> Option<(Chunks, usize, usize, usize)> {
+        // Bounds check
+        if byte_idx <= self.len_bytes() {
+            Some(Chunks::new_with_range_at_byte(
+                &self.root,
+                byte_idx,
+                (0, self.len_bytes()),
+                (0, self.len_chars()),
+                (0, self.len_lines()),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunks_at_char()`](Rope::chunks_at_char).
+    #[inline]
+    pub fn get_chunks_at_char(&self, char_idx: usize) -> Option<(Chunks, usize, usize, usize)> {
+        // Bounds check
+        if char_idx <= self.len_chars() {
+            Some(Chunks::new_with_range_at_char(
+                &self.root,
+                char_idx,
+                (0, self.len_bytes()),
+                (0, self.len_chars()),
+                (0, self.len_lines()),
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Non-panicking version of [`chunks_at_line_break()`](Rope::chunks_at_line_break).
+    #[inline]
+    pub fn get_chunks_at_line_break(
+        &self,
+        line_break_idx: usize,
+    ) -> Option<(Chunks, usize, usize, usize)> {
+        // Bounds check
+        if line_break_idx <= self.len_lines() {
+            Some(Chunks::new_with_range_at_line_break(
+                &self.root,
+                line_break_idx,
+                (0, self.len_bytes()),
+                (0, self.len_chars()),
+                (0, self.len_lines()),
+            ))
+        } else {
+            None
         }
     }
 }

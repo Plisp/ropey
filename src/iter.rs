@@ -9,8 +9,9 @@
 //! # Reverse iteration
 //!
 //! All iterators in Ropey operate as a cursor that can move both forwards
-//! and backwards over its contents.  Doing this is accomplished via the
-//! `next()` and `prev()` methods of each iterator.
+//! and backwards over its contents.  This can be accomplished via the
+//! `next()` and `prev()` methods on each iterator, or by using the `reverse()`
+//! method to change the iterator's direction.
 //!
 //! Conceptually, an iterator in Ropey is always positioned *between* the
 //! elements it iterates over, and returns an element when it jumps over it
@@ -28,7 +29,8 @@
 //! 4. `abc|` -> `None`
 //!
 //! The `prev()` method operates identically, except moving in the opposite
-//! direction.
+//! direction.  And `reverse()` simply swaps the behavior of `prev()` and
+//! `next()`.
 //!
 //! # Creating iterators at any position
 //!
@@ -46,6 +48,21 @@
 //! can create a `Chars` iterator starting at the end of a `Rope`, and then
 //! use the `prev()` method to iterate backwards over all of that `Rope`'s
 //! chars.
+//!
+//! # A possible point of confusion
+//!
+//! The Rust standard library has an iterator trait `DoubleEndedIterator` with
+//! a method `rev()`.  While this method's name is very similar to Ropey's
+//! `reverse()` method, its behavior is very different.
+//!
+//! `DoubleEndedIterator` actually provides two iterators: one starting at each
+//! end of the collection, moving in opposite directions towards each other.
+//! Calling `rev()` switches between those two iterators, changing not only the
+//! direction of iteration but also its current position in the collection.
+//!
+//! The `reverse()` method on Ropey's iterators, on the other hand, reverses
+//! the direction of the iterator in-place, without changing its position in
+//! the text.
 
 use std::str;
 use std::sync::Arc;
@@ -65,8 +82,10 @@ pub struct Bytes<'a> {
     chunk_iter: Chunks<'a>,
     cur_chunk: &'a [u8],
     byte_idx: usize,
-    last_op_was_prev: bool,
+    last_call_was_prev_impl: bool,
+    bytes_total: usize,
     bytes_remaining: usize,
+    is_reversed: bool,
 }
 
 impl<'a> Bytes<'a> {
@@ -81,8 +100,10 @@ impl<'a> Bytes<'a> {
             chunk_iter: chunk_iter,
             cur_chunk: cur_chunk.as_bytes(),
             byte_idx: 0,
-            last_op_was_prev: false,
+            last_call_was_prev_impl: false,
+            bytes_total: node.text_info().bytes as usize,
             bytes_remaining: node.text_info().bytes as usize,
+            is_reversed: false,
         }
     }
 
@@ -132,8 +153,10 @@ impl<'a> Bytes<'a> {
             chunk_iter: chunk_iter,
             cur_chunk: cur_chunk.as_bytes(),
             byte_idx: at_byte - chunk_byte_start,
-            last_op_was_prev: false,
+            last_call_was_prev_impl: false,
+            bytes_total: byte_idx_range.1 - byte_idx_range.0,
             bytes_remaining: byte_idx_range.1 - at_byte,
+            is_reversed: false,
         }
     }
 
@@ -153,19 +176,40 @@ impl<'a> Bytes<'a> {
             chunk_iter: chunk_iter,
             cur_chunk: cur_chunk.as_bytes(),
             byte_idx: byte_idx,
-            last_op_was_prev: false,
+            last_call_was_prev_impl: false,
+            bytes_total: text.len(),
             bytes_remaining: text.len() - byte_idx,
+            is_reversed: false,
         }
+    }
+
+    /// Reverses the direction of the iterator in-place.
+    ///
+    /// In other words, swaps the behavior of [`prev()`](Bytes::prev())
+    /// and [`next()`](Bytes::next()).
+    #[inline]
+    pub fn reverse(&mut self) {
+        self.is_reversed = !self.is_reversed;
     }
 
     /// Advances the iterator backwards and returns the previous value.
     ///
     /// Runs in amortized O(1) time and worst-case O(log N) time.
+    #[inline(always)]
     pub fn prev(&mut self) -> Option<u8> {
+        if !self.is_reversed {
+            self.prev_impl()
+        } else {
+            self.next_impl()
+        }
+    }
+
+    #[inline]
+    fn prev_impl(&mut self) -> Option<u8> {
         // Put us back into a "prev" progression.
-        if !self.last_op_was_prev {
+        if !self.last_call_was_prev_impl {
             self.chunk_iter.prev();
-            self.last_op_was_prev = true;
+            self.last_call_was_prev_impl = true;
         }
 
         // Progress the chunks iterator back if needed.
@@ -183,19 +227,13 @@ impl<'a> Bytes<'a> {
         self.bytes_remaining += 1;
         return Some(self.cur_chunk[self.byte_idx]);
     }
-}
 
-impl<'a> Iterator for Bytes<'a> {
-    type Item = u8;
-
-    /// Advances the iterator forward and returns the next value.
-    ///
-    /// Runs in amortized O(1) time and worst-case O(log N) time.
-    fn next(&mut self) -> Option<u8> {
+    #[inline]
+    fn next_impl(&mut self) -> Option<u8> {
         // Put us back into a "next" progression.
-        if self.last_op_was_prev {
+        if self.last_call_was_prev_impl {
             self.chunk_iter.next();
-            self.last_op_was_prev = false;
+            self.last_call_was_prev_impl = false;
         }
 
         // Progress the chunks iterator forward if needed.
@@ -214,9 +252,30 @@ impl<'a> Iterator for Bytes<'a> {
         self.bytes_remaining -= 1;
         return Some(byte);
     }
+}
+
+impl<'a> Iterator for Bytes<'a> {
+    type Item = u8;
+
+    /// Advances the iterator forward and returns the next value.
+    ///
+    /// Runs in amortized O(1) time and worst-case O(log N) time.
+    #[inline(always)]
+    fn next(&mut self) -> Option<u8> {
+        if !self.is_reversed {
+            self.next_impl()
+        } else {
+            self.prev_impl()
+        }
+    }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.bytes_remaining, Some(self.bytes_remaining))
+        let remaining = if !self.is_reversed {
+            self.bytes_remaining
+        } else {
+            self.bytes_total - self.bytes_remaining
+        };
+        (remaining, Some(remaining))
     }
 }
 
@@ -230,8 +289,10 @@ pub struct Chars<'a> {
     chunk_iter: Chunks<'a>,
     cur_chunk: &'a str,
     byte_idx: usize,
-    last_op_was_prev: bool,
+    last_call_was_prev_impl: bool,
+    chars_total: usize,
     chars_remaining: usize,
+    is_reversed: bool,
 }
 
 impl<'a> Chars<'a> {
@@ -246,8 +307,10 @@ impl<'a> Chars<'a> {
             chunk_iter: chunk_iter,
             cur_chunk: cur_chunk,
             byte_idx: 0,
-            last_op_was_prev: false,
+            last_call_was_prev_impl: false,
+            chars_total: node.text_info().chars as usize,
             chars_remaining: node.text_info().chars as usize,
+            is_reversed: false,
         }
     }
 
@@ -298,8 +361,10 @@ impl<'a> Chars<'a> {
             chunk_iter: chunk_iter,
             cur_chunk: cur_chunk,
             byte_idx: char_to_byte_idx(cur_chunk, at_char - chunk_char_start),
-            last_op_was_prev: false,
+            last_call_was_prev_impl: false,
+            chars_total: char_idx_range.1 - char_idx_range.0,
             chars_remaining: char_idx_range.1 - at_char,
+            is_reversed: false,
         }
     }
 
@@ -316,24 +381,46 @@ impl<'a> Chars<'a> {
             ""
         };
         let start_byte_idx = char_to_byte_idx(text, char_idx);
+        let chars_remaining = count_chars(&text[start_byte_idx..]);
 
         Chars {
             chunk_iter: chunk_iter,
             cur_chunk: cur_chunk,
             byte_idx: start_byte_idx,
-            last_op_was_prev: false,
-            chars_remaining: count_chars(&text[start_byte_idx..]),
+            last_call_was_prev_impl: false,
+            chars_total: chars_remaining + count_chars(&text[..start_byte_idx]),
+            chars_remaining: chars_remaining,
+            is_reversed: false,
         }
+    }
+
+    /// Reverses the direction of the iterator in-place.
+    ///
+    /// In other words, swaps the behavior of [`prev()`](Chars::prev())
+    /// and [`next()`](Chars::next()).
+    #[inline]
+    pub fn reverse(&mut self) {
+        self.is_reversed = !self.is_reversed;
     }
 
     /// Advances the iterator backwards and returns the previous value.
     ///
     /// Runs in amortized O(1) time and worst-case O(log N) time.
+    #[inline(always)]
     pub fn prev(&mut self) -> Option<char> {
+        if !self.is_reversed {
+            self.prev_impl()
+        } else {
+            self.next_impl()
+        }
+    }
+
+    #[inline]
+    pub fn prev_impl(&mut self) -> Option<char> {
         // Put us back into a "prev" progression.
-        if !self.last_op_was_prev {
+        if !self.last_call_was_prev_impl {
             self.chunk_iter.prev();
-            self.last_op_was_prev = true;
+            self.last_call_was_prev_impl = true;
         }
 
         // Progress the chunks iterator back if needed.
@@ -355,19 +442,13 @@ impl<'a> Chars<'a> {
         self.chars_remaining += 1;
         return (&self.cur_chunk[self.byte_idx..]).chars().next();
     }
-}
 
-impl<'a> Iterator for Chars<'a> {
-    type Item = char;
-
-    /// Advances the iterator forward and returns the next value.
-    ///
-    /// Runs in amortized O(1) time and worst-case O(log N) time.
-    fn next(&mut self) -> Option<char> {
+    #[inline]
+    pub fn next_impl(&mut self) -> Option<char> {
         // Put us back into a "next" progression.
-        if self.last_op_was_prev {
+        if self.last_call_was_prev_impl {
             self.chunk_iter.next();
-            self.last_op_was_prev = false;
+            self.last_call_was_prev_impl = false;
         }
 
         // Progress the chunks iterator forward if needed.
@@ -390,9 +471,30 @@ impl<'a> Iterator for Chars<'a> {
         self.chars_remaining -= 1;
         return (&self.cur_chunk[start..]).chars().next();
     }
+}
+
+impl<'a> Iterator for Chars<'a> {
+    type Item = char;
+
+    /// Advances the iterator forward and returns the next value.
+    ///
+    /// Runs in amortized O(1) time and worst-case O(log N) time.
+    #[inline(always)]
+    fn next(&mut self) -> Option<char> {
+        if !self.is_reversed {
+            self.next_impl()
+        } else {
+            self.prev_impl()
+        }
+    }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.chars_remaining, Some(self.chars_remaining))
+        let remaining = if !self.is_reversed {
+            self.chars_remaining
+        } else {
+            self.chars_total - self.chars_remaining
+        };
+        (remaining, Some(remaining))
     }
 }
 
@@ -407,12 +509,15 @@ impl<'a> ExactSizeIterator for Chars<'a> {}
 
 /// An iterator over a `Rope`'s lines.
 ///
-/// The returned lines include the line-break at the end.
+/// The returned lines include the line break at the end.
 ///
 /// The last line is returned even if blank, in which case it
 /// is returned as an empty slice.
 #[derive(Debug, Clone)]
-pub struct Lines<'a>(LinesEnum<'a>);
+pub struct Lines<'a> {
+    iter: LinesEnum<'a>,
+    is_reversed: bool,
+}
 
 #[derive(Debug, Clone)]
 enum LinesEnum<'a> {
@@ -435,14 +540,17 @@ enum LinesEnum<'a> {
 
 impl<'a> Lines<'a> {
     pub(crate) fn new(node: &Arc<Node>) -> Lines {
-        Lines(LinesEnum::Full {
-            node: node,
-            start_char: 0,
-            end_char: node.text_info().chars as usize,
-            start_line: 0,
-            total_line_breaks: node.line_break_count(),
-            line_idx: 0,
-        })
+        Lines {
+            iter: LinesEnum::Full {
+                node: node,
+                start_char: 0,
+                end_char: node.text_info().chars as usize,
+                start_line: 0,
+                total_line_breaks: node.line_break_count(),
+                line_idx: 0,
+            },
+            is_reversed: false,
+        }
     }
 
     pub(crate) fn new_with_range(
@@ -464,24 +572,30 @@ impl<'a> Lines<'a> {
         char_idx_range: (usize, usize),
         line_break_idx_range: (usize, usize),
     ) -> Lines {
-        Lines(LinesEnum::Full {
-            node: node,
-            start_char: char_idx_range.0,
-            end_char: char_idx_range.1,
-            start_line: line_break_idx_range.0,
-            total_line_breaks: line_break_idx_range.1 - line_break_idx_range.0 - 1,
-            line_idx: at_line,
-        })
+        Lines {
+            iter: LinesEnum::Full {
+                node: node,
+                start_char: char_idx_range.0,
+                end_char: char_idx_range.1,
+                start_line: line_break_idx_range.0,
+                total_line_breaks: line_break_idx_range.1 - line_break_idx_range.0 - 1,
+                line_idx: at_line,
+            },
+            is_reversed: false,
+        }
     }
 
     pub(crate) fn from_str(text: &str) -> Lines {
-        Lines(LinesEnum::Light {
-            text: text,
-            total_line_breaks: byte_to_line_idx(text, text.len()),
-            line_idx: 0,
-            byte_idx: 0,
-            at_end: false,
-        })
+        Lines {
+            iter: LinesEnum::Light {
+                text: text,
+                total_line_breaks: byte_to_line_idx(text, text.len()),
+                line_idx: 0,
+                byte_idx: 0,
+                at_end: false,
+            },
+            is_reversed: false,
+        }
     }
 
     pub(crate) fn from_str_at(text: &str, line_idx: usize) -> Lines {
@@ -492,19 +606,41 @@ impl<'a> Lines<'a> {
         lines_iter
     }
 
+    /// Reverses the direction of the iterator in-place.
+    ///
+    /// In other words, swaps the behavior of [`prev()`](Lines::prev())
+    /// and [`next()`](Lines::next()).
+    #[inline]
+    pub fn reverse(&mut self) {
+        self.is_reversed = !self.is_reversed;
+    }
+
     /// Advances the iterator backwards and returns the previous value.
     ///
     /// Runs in O(log N) time.
+    #[inline(always)]
     pub fn prev(&mut self) -> Option<RopeSlice<'a>> {
+        if !self.is_reversed {
+            self.prev_impl()
+        } else {
+            self.next_impl()
+        }
+    }
+
+    fn prev_impl(&mut self) -> Option<RopeSlice<'a>> {
         match *self {
-            Lines(LinesEnum::Full {
-                ref mut node,
-                start_char,
-                end_char,
-                start_line,
-                ref mut line_idx,
+            Lines {
+                iter:
+                    LinesEnum::Full {
+                        ref mut node,
+                        start_char,
+                        end_char,
+                        start_line,
+                        ref mut line_idx,
+                        ..
+                    },
                 ..
-            }) => {
+            } => {
                 if *line_idx == start_line {
                     return None;
                 } else {
@@ -534,13 +670,17 @@ impl<'a> Lines<'a> {
                     return Some(RopeSlice::new_with_range(node, a, b));
                 }
             }
-            Lines(LinesEnum::Light {
-                ref mut text,
-                ref mut line_idx,
-                ref mut byte_idx,
-                ref mut at_end,
+            Lines {
+                iter:
+                    LinesEnum::Light {
+                        ref mut text,
+                        ref mut line_idx,
+                        ref mut byte_idx,
+                        ref mut at_end,
+                        ..
+                    },
                 ..
-            }) => {
+            } => {
                 // Special cases.
                 if *at_end && (text.is_empty() || ends_with_line_break(text)) {
                     *line_idx -= 1;
@@ -559,23 +699,20 @@ impl<'a> Lines<'a> {
             }
         }
     }
-}
 
-impl<'a> Iterator for Lines<'a> {
-    type Item = RopeSlice<'a>;
-
-    /// Advances the iterator forward and returns the next value.
-    ///
-    /// Runs in O(log N) time.
-    fn next(&mut self) -> Option<RopeSlice<'a>> {
+    fn next_impl(&mut self) -> Option<RopeSlice<'a>> {
         match *self {
-            Lines(LinesEnum::Full {
-                ref mut node,
-                start_char,
-                end_char,
-                ref mut line_idx,
+            Lines {
+                iter:
+                    LinesEnum::Full {
+                        ref mut node,
+                        start_char,
+                        end_char,
+                        ref mut line_idx,
+                        ..
+                    },
                 ..
-            }) => {
+            } => {
                 if *line_idx > node.line_break_count() {
                     return None;
                 } else {
@@ -612,13 +749,17 @@ impl<'a> Iterator for Lines<'a> {
                     return Some(RopeSlice::new_with_range(node, a, b));
                 }
             }
-            Lines(LinesEnum::Light {
-                ref mut text,
-                ref mut line_idx,
-                ref mut byte_idx,
-                ref mut at_end,
+            Lines {
+                iter:
+                    LinesEnum::Light {
+                        ref mut text,
+                        ref mut line_idx,
+                        ref mut byte_idx,
+                        ref mut at_end,
+                        ..
+                    },
                 ..
-            }) => {
+            } => {
                 if *at_end {
                     return None;
                 } else if *byte_idx == text.len() {
@@ -640,20 +781,57 @@ impl<'a> Iterator for Lines<'a> {
             }
         }
     }
+}
+
+impl<'a> Iterator for Lines<'a> {
+    type Item = RopeSlice<'a>;
+
+    /// Advances the iterator forward and returns the next value.
+    ///
+    /// Runs in O(log N) time.
+    #[inline(always)]
+    fn next(&mut self) -> Option<RopeSlice<'a>> {
+        if !self.is_reversed {
+            self.next_impl()
+        } else {
+            self.prev_impl()
+        }
+    }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let lines_remaining = match *self {
-            Lines(LinesEnum::Full {
-                start_line,
-                total_line_breaks,
-                line_idx,
-                ..
-            }) => total_line_breaks + 1 - (line_idx - start_line),
-            Lines(LinesEnum::Light {
-                total_line_breaks,
-                line_idx,
-                ..
-            }) => total_line_breaks + 1 - line_idx,
+            Lines {
+                iter:
+                    LinesEnum::Full {
+                        start_line,
+                        total_line_breaks,
+                        line_idx,
+                        ..
+                    },
+                is_reversed,
+            } => {
+                if !is_reversed {
+                    total_line_breaks + 1 - (line_idx - start_line)
+                } else {
+                    line_idx - start_line
+                }
+            }
+
+            Lines {
+                iter:
+                    LinesEnum::Light {
+                        total_line_breaks,
+                        line_idx,
+                        ..
+                    },
+                is_reversed,
+            } => {
+                if !is_reversed {
+                    total_line_breaks + 1 - line_idx
+                } else {
+                    line_idx
+                }
+            }
         };
 
         (lines_remaining, Some(lines_remaining))
@@ -671,8 +849,8 @@ impl<'a> ExactSizeIterator for Lines<'a> {}
 /// `&str` slice for each one.  It is useful for situations such as:
 ///
 /// - Writing a rope's utf8 text data to disk (but see
-///   [`Rope::write_to()`](../struct.Rope.html#method.write_to) for a
-///   convenience function that does this).
+///   [`write_to()`](Rope::write_to) for a convenience function that does this
+///   for casual use-cases).
 /// - Streaming a rope's text data somewhere.
 /// - Saving a rope to a non-utf8 encoding, doing the encoding conversion
 ///   incrementally as you go.
@@ -684,11 +862,14 @@ impl<'a> ExactSizeIterator for Lines<'a> {}
 /// - CRLF pairs are never split across chunks.
 ///
 /// There are no guarantees about the size of yielded chunks, and except for
-/// CRLF pairs there are no guarantees about where the chunks are split.  For
-/// example, they may be zero-sized, they don't necessarily align with line
-/// breaks, etc.
+/// CRLF pairs and being valid `str` slices there are no guarantees about
+/// where the chunks are split.  For example, they may be zero-sized, they
+/// don't necessarily align with line breaks, etc.
 #[derive(Debug, Clone)]
-pub struct Chunks<'a>(ChunksEnum<'a>);
+pub struct Chunks<'a> {
+    iter: ChunksEnum<'a>,
+    is_reversed: bool,
+}
 
 #[derive(Debug, Clone)]
 enum ChunksEnum<'a> {
@@ -766,10 +947,13 @@ impl<'a> Chunks<'a> {
         // Special-case for empty text contents.
         if start_byte == end_byte {
             return (
-                Chunks(ChunksEnum::Light {
-                    text: "",
-                    is_end: false,
-                }),
+                Chunks {
+                    iter: ChunksEnum::Light {
+                        text: "",
+                        is_end: false,
+                    },
+                    is_reversed: false,
+                },
                 0,
                 0,
                 0,
@@ -781,20 +965,26 @@ impl<'a> Chunks<'a> {
             let text = &node.leaf_text()[start_byte..end_byte];
             if at_byte == end_byte {
                 return (
-                    Chunks(ChunksEnum::Light {
-                        text: text,
-                        is_end: true,
-                    }),
+                    Chunks {
+                        iter: ChunksEnum::Light {
+                            text: text,
+                            is_end: true,
+                        },
+                        is_reversed: false,
+                    },
                     text.len(),
                     count_chars(text),
                     byte_to_line_idx(text, text.len()),
                 );
             } else {
                 return (
-                    Chunks(ChunksEnum::Light {
-                        text: text,
-                        is_end: false,
-                    }),
+                    Chunks {
+                        iter: ChunksEnum::Light {
+                            text: text,
+                            is_end: false,
+                        },
+                        is_reversed: false,
+                    },
                     0,
                     0,
                     0,
@@ -840,11 +1030,14 @@ impl<'a> Chunks<'a> {
 
         // Create the iterator.
         (
-            Chunks(ChunksEnum::Full {
-                node_stack: node_stack,
-                total_bytes: end_byte - start_byte,
-                byte_idx: byte_idx,
-            }),
+            Chunks {
+                iter: ChunksEnum::Full {
+                    node_stack: node_stack,
+                    total_bytes: end_byte - start_byte,
+                    byte_idx: byte_idx,
+                },
+                is_reversed: false,
+            },
             (info.bytes as usize).max(byte_idx_range.0),
             (info.chars as usize).max(char_idx_range.0),
             (info.line_breaks as usize).max(line_break_idx_range.0),
@@ -898,22 +1091,47 @@ impl<'a> Chunks<'a> {
     }
 
     pub(crate) fn from_str(text: &str, at_end: bool) -> Chunks {
-        Chunks(ChunksEnum::Light {
-            text: text,
-            is_end: at_end,
-        })
+        Chunks {
+            iter: ChunksEnum::Light {
+                text: text,
+                is_end: at_end,
+            },
+            is_reversed: false,
+        }
+    }
+
+    /// Reverses the direction of the iterator in-place.
+    ///
+    /// In other words, swaps the behavior of [`prev()`](Chunks::prev())
+    /// and [`next()`](Chunks::next()).
+    #[inline]
+    pub fn reverse(&mut self) {
+        self.is_reversed = !self.is_reversed;
     }
 
     /// Advances the iterator backwards and returns the previous value.
     ///
     /// Runs in amortized O(1) time and worst-case O(log N) time.
+    #[inline(always)]
     pub fn prev(&mut self) -> Option<&'a str> {
+        if !self.is_reversed {
+            self.prev_impl()
+        } else {
+            self.next_impl()
+        }
+    }
+
+    fn prev_impl(&mut self) -> Option<&'a str> {
         match *self {
-            Chunks(ChunksEnum::Full {
-                ref mut node_stack,
-                total_bytes,
-                ref mut byte_idx,
-            }) => {
+            Chunks {
+                iter:
+                    ChunksEnum::Full {
+                        ref mut node_stack,
+                        total_bytes,
+                        ref mut byte_idx,
+                    },
+                ..
+            } => {
                 if *byte_idx <= 0 {
                     return None;
                 }
@@ -959,10 +1177,14 @@ impl<'a> Chunks<'a> {
                 return Some(text_slice);
             }
 
-            Chunks(ChunksEnum::Light {
-                text,
-                ref mut is_end,
-            }) => {
+            Chunks {
+                iter:
+                    ChunksEnum::Light {
+                        text,
+                        ref mut is_end,
+                    },
+                ..
+            } => {
                 if !*is_end || text.is_empty() {
                     return None;
                 } else {
@@ -972,21 +1194,18 @@ impl<'a> Chunks<'a> {
             }
         }
     }
-}
 
-impl<'a> Iterator for Chunks<'a> {
-    type Item = &'a str;
-
-    /// Advances the iterator forward and returns the next value.
-    ///
-    /// Runs in amortized O(1) time and worst-case O(log N) time.
-    fn next(&mut self) -> Option<&'a str> {
+    fn next_impl(&mut self) -> Option<&'a str> {
         match *self {
-            Chunks(ChunksEnum::Full {
-                ref mut node_stack,
-                total_bytes,
-                ref mut byte_idx,
-            }) => {
+            Chunks {
+                iter:
+                    ChunksEnum::Full {
+                        ref mut node_stack,
+                        total_bytes,
+                        ref mut byte_idx,
+                    },
+                ..
+            } => {
                 if *byte_idx >= total_bytes as isize {
                     return None;
                 }
@@ -1033,10 +1252,14 @@ impl<'a> Iterator for Chunks<'a> {
                 return Some(text_slice);
             }
 
-            Chunks(ChunksEnum::Light {
-                text,
-                ref mut is_end,
-            }) => {
+            Chunks {
+                iter:
+                    ChunksEnum::Light {
+                        text,
+                        ref mut is_end,
+                    },
+                ..
+            } => {
                 if *is_end || text.is_empty() {
                     return None;
                 } else {
@@ -1044,6 +1267,22 @@ impl<'a> Iterator for Chunks<'a> {
                     return Some(text);
                 }
             }
+        }
+    }
+}
+
+impl<'a> Iterator for Chunks<'a> {
+    type Item = &'a str;
+
+    /// Advances the iterator forward and returns the next value.
+    ///
+    /// Runs in amortized O(1) time and worst-case O(log N) time.
+    #[inline(always)]
+    fn next(&mut self) -> Option<&'a str> {
+        if !self.is_reversed {
+            self.next_impl()
+        } else {
+            self.prev_impl()
         }
     }
 }
@@ -1291,6 +1530,90 @@ mod tests {
     }
 
     #[test]
+    fn bytes_reverse_01() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.bytes();
+        let mut stack = Vec::new();
+
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
+        }
+    }
+
+    #[test]
+    fn bytes_reverse_02() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.bytes_at(r.len_bytes() / 3);
+        let mut stack = Vec::new();
+
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
+        }
+    }
+
+    #[test]
+    fn bytes_reverse_03() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.bytes_at(r.len_bytes() / 3);
+        let mut stack = Vec::new();
+
+        itr.reverse();
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
+        }
+    }
+
+    #[test]
+    fn bytes_reverse_04() {
+        let mut itr = Bytes::from_str("a");
+
+        assert_eq!(Some(0x61), itr.next());
+        assert_eq!(None, itr.next());
+        itr.reverse();
+        assert_eq!(Some(0x61), itr.next());
+        assert_eq!(None, itr.next());
+    }
+
+    #[test]
+    fn bytes_reverse_exact_size_iter_01() {
+        let r = Rope::from_str(TEXT);
+        let s = r.slice(34..301);
+
+        let mut bytes = s.bytes_at(42);
+        bytes.reverse();
+        let mut byte_count = 42;
+
+        assert_eq!(42, bytes.len());
+
+        while let Some(_) = bytes.next() {
+            byte_count -= 1;
+            assert_eq!(byte_count, bytes.len());
+        }
+
+        bytes.next();
+        bytes.next();
+        bytes.next();
+        bytes.next();
+        bytes.next();
+        bytes.next();
+        bytes.next();
+        assert_eq!(bytes.len(), 0);
+        assert_eq!(byte_count, 0);
+    }
+
+    #[test]
     fn chars_01() {
         let r = Rope::from_str(TEXT);
         for (cr, ct) in r.chars().zip(TEXT.chars()) {
@@ -1442,6 +1765,90 @@ mod tests {
         assert_eq!(chars.len(), s.len_chars());
         chars.prev();
         assert_eq!(chars.len(), s.len_chars());
+    }
+
+    #[test]
+    fn chars_reverse_01() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.chars();
+        let mut stack = Vec::new();
+
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
+        }
+    }
+
+    #[test]
+    fn chars_reverse_02() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.chars_at(r.len_chars() / 3);
+        let mut stack = Vec::new();
+
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
+        }
+    }
+
+    #[test]
+    fn chars_reverse_03() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.chars_at(r.len_chars() / 3);
+        let mut stack = Vec::new();
+
+        itr.reverse();
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
+        }
+    }
+
+    #[test]
+    fn chars_reverse_04() {
+        let mut itr = Chars::from_str("a");
+
+        assert_eq!(Some('a'), itr.next());
+        assert_eq!(None, itr.next());
+        itr.reverse();
+        assert_eq!(Some('a'), itr.next());
+        assert_eq!(None, itr.next());
+    }
+
+    #[test]
+    fn chars_reverse_exact_size_iter_01() {
+        let r = Rope::from_str(TEXT);
+        let s = r.slice(34..301);
+
+        let mut chars = s.chars_at(42);
+        chars.reverse();
+        let mut char_count = 42;
+
+        assert_eq!(42, chars.len());
+
+        while let Some(_) = chars.next() {
+            char_count -= 1;
+            assert_eq!(char_count, chars.len());
+        }
+
+        chars.next();
+        chars.next();
+        chars.next();
+        chars.next();
+        chars.next();
+        chars.next();
+        chars.next();
+        assert_eq!(chars.len(), 0);
+        assert_eq!(char_count, 0);
     }
 
     #[test]
@@ -1905,6 +2312,92 @@ mod tests {
     }
 
     #[test]
+    fn lines_reverse_01() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.lines();
+        let mut stack = Vec::new();
+
+        for _ in 0..8 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..8 {
+            assert_eq!(stack.pop().unwrap(), itr.next().unwrap());
+        }
+    }
+
+    #[test]
+    fn lines_reverse_02() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.lines_at(r.len_lines() / 3);
+        let mut stack = Vec::new();
+
+        for _ in 0..8 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..8 {
+            assert_eq!(stack.pop().unwrap(), itr.next().unwrap());
+        }
+    }
+
+    #[test]
+    fn lines_reverse_03() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.lines_at(r.len_lines() / 3);
+        let mut stack = Vec::new();
+
+        itr.reverse();
+        for _ in 0..8 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..8 {
+            assert_eq!(stack.pop().unwrap(), itr.next().unwrap());
+        }
+    }
+
+    #[test]
+    fn lines_reverse_04() {
+        let mut itr = Lines::from_str("a\n");
+
+        assert_eq!(Some("a\n".into()), itr.next());
+        assert_eq!(Some("".into()), itr.next());
+        assert_eq!(None, itr.next());
+        itr.reverse();
+        assert_eq!(Some("".into()), itr.next());
+        assert_eq!(Some("a\n".into()), itr.next());
+        assert_eq!(None, itr.next());
+    }
+
+    #[test]
+    fn lines_reverse_exact_size_iter_01() {
+        let r = Rope::from_str(TEXT);
+        let s = r.slice(34..301);
+
+        let mut lines = s.lines_at(4);
+        lines.reverse();
+        let mut line_count = 4;
+
+        assert_eq!(4, lines.len());
+
+        while let Some(_) = lines.next() {
+            line_count -= 1;
+            assert_eq!(line_count, lines.len());
+        }
+
+        lines.next();
+        lines.next();
+        lines.next();
+        lines.next();
+        lines.next();
+        lines.next();
+        lines.next();
+        assert_eq!(lines.len(), 0);
+        assert_eq!(line_count, 0);
+    }
+
+    #[test]
     fn chunks_01() {
         let r = Rope::from_str(TEXT);
 
@@ -2110,6 +2603,63 @@ mod tests {
     }
 
     #[test]
+    fn chunks_reverse_01() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.chunks();
+        let mut stack = Vec::new();
+
+        for _ in 0..8 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..8 {
+            assert_eq!(stack.pop().unwrap(), itr.next().unwrap());
+        }
+    }
+
+    #[test]
+    fn chunks_reverse_02() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.chunks_at_char(r.len_chars() / 3).0;
+        let mut stack = Vec::new();
+
+        for _ in 0..8 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..8 {
+            assert_eq!(stack.pop().unwrap(), itr.next().unwrap());
+        }
+    }
+
+    #[test]
+    fn chunks_reverse_03() {
+        let r = Rope::from_str(TEXT);
+        let mut itr = r.chunks_at_char(r.len_chars() / 3).0;
+        let mut stack = Vec::new();
+
+        itr.reverse();
+        for _ in 0..8 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..8 {
+            assert_eq!(stack.pop().unwrap(), itr.next().unwrap());
+        }
+    }
+
+    #[test]
+    fn chunks_reverse_04() {
+        let mut itr = Chunks::from_str("a\n", false);
+
+        assert_eq!(Some("a\n"), itr.next());
+        assert_eq!(None, itr.next());
+        itr.reverse();
+        assert_eq!(Some("a\n"), itr.next());
+        assert_eq!(None, itr.next());
+    }
+
+    #[test]
     fn bytes_sliced_01() {
         let r = Rope::from_str(TEXT);
 
@@ -2135,6 +2685,25 @@ mod tests {
         }
 
         assert_eq!(s1_bytes.len(), 0);
+    }
+
+    #[test]
+    fn bytes_sliced_reverse_01() {
+        let r = Rope::from_str(TEXT);
+
+        let s_start = 34;
+        let s_end = 301;
+        let s = r.slice(s_start..s_end);
+
+        let mut itr = s.bytes();
+        let mut stack = Vec::new();
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
+        }
     }
 
     #[test]
@@ -2184,6 +2753,25 @@ mod tests {
     }
 
     #[test]
+    fn bytes_at_sliced_reverse_01() {
+        let r = Rope::from_str(TEXT);
+
+        let s_start = 34;
+        let s_end = 301;
+        let s = r.slice(s_start..s_end);
+
+        let mut itr = s.bytes_at(s.len_bytes() / 3);
+        let mut stack = Vec::new();
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
+        }
+    }
+
+    #[test]
     fn chars_sliced_01() {
         let r = Rope::from_str(TEXT);
 
@@ -2197,6 +2785,25 @@ mod tests {
 
         for (cr, ct) in s1.chars().zip(s2.chars()) {
             assert_eq!(cr, ct);
+        }
+    }
+
+    #[test]
+    fn chars_sliced_reverse_01() {
+        let r = Rope::from_str(TEXT);
+
+        let s_start = 34;
+        let s_end = 301;
+        let s = r.slice(s_start..s_end);
+
+        let mut itr = s.chars();
+        let mut stack = Vec::new();
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
         }
     }
 
@@ -2247,6 +2854,25 @@ mod tests {
     }
 
     #[test]
+    fn chars_at_sliced_reverse_01() {
+        let r = Rope::from_str(TEXT);
+
+        let s_start = 34;
+        let s_end = 301;
+        let s = r.slice(s_start..s_end);
+
+        let mut itr = s.chars_at(s.len_chars() / 3);
+        let mut stack = Vec::new();
+        for _ in 0..32 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..32 {
+            assert_eq!(stack.pop(), itr.next());
+        }
+    }
+
+    #[test]
     fn lines_sliced_01() {
         let r = Rope::from_str(TEXT);
 
@@ -2260,6 +2886,25 @@ mod tests {
 
         for (liner, linet) in s1.lines().zip(s2.lines()) {
             assert_eq!(liner.to_string().trim_end(), linet);
+        }
+    }
+
+    #[test]
+    fn lines_sliced_reverse_01() {
+        let r = Rope::from_str(TEXT);
+
+        let s_start = 34;
+        let s_end = 301;
+        let s = r.slice(s_start..s_end);
+
+        let mut itr = s.lines();
+        let mut stack = Vec::new();
+        for _ in 0..4 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..4 {
+            assert_eq!(stack.pop().unwrap(), itr.next().unwrap());
         }
     }
 
@@ -2282,5 +2927,24 @@ mod tests {
         }
 
         assert_eq!(idx, s2.len());
+    }
+
+    #[test]
+    fn chunks_sliced_reverse_01() {
+        let r = Rope::from_str(TEXT);
+
+        let s_start = 34;
+        let s_end = 301;
+        let s = r.slice(s_start..s_end);
+
+        let mut itr = s.chunks();
+        let mut stack = Vec::new();
+        for _ in 0..8 {
+            stack.push(itr.next().unwrap());
+        }
+        itr.reverse();
+        for _ in 0..8 {
+            assert_eq!(stack.pop(), itr.next());
+        }
     }
 }
